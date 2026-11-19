@@ -1,0 +1,2872 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>SP-202 GOLF // LIQUID GLASS CANVAS WORKSTATION</title>
+<style>html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#05080f;user-select:none}canvas{display:block;width:100vw;height:100vh}</style>
+</head>
+<body>
+<canvas id="app"></canvas>
+<input type="file" id="fIn" accept="audio/*" multiple hidden>
+<input type="file" id="projIn" accept=".json,.sp202.json" hidden>
+<script>
+(() => {
+const cv = document.getElementById("app");
+const ctx = cv.getContext("2d");
+const fIn = document.getElementById("fIn");
+const projIn = document.getElementById("projIn");
+
+// ==========================================
+// 1. CONSTANTS & SP-202 DSP PROFILES
+// ==========================================
+const G = [
+  { name: "HI-FI",    sr: 31250,   bits: 12, mu: 255, pre: .94, post: .96, hiss: .0004, makeup: 1.00 },
+  { name: "STANDARD", sr: 15625,   bits: 10, mu: 128, pre: .90, post: .92, hiss: .0010, makeup: 1.15 },
+  { name: "LO-FI 1",  sr: 7812.5,  bits: 8,  mu: 64,  pre: .88, post: .90, hiss: .0022, makeup: 1.32 },
+  { name: "LO-FI 2",  sr: 3906.25, bits: 7,  mu: 32,  pre: .86, post: .88, hiss: .0036, makeup: 1.52 }
+];
+const FMODES = ["OFF", "LPF 24dB", "HPF 24dB", "BPF 24dB"];
+const BEATS_OPT = [1, 2, 4, 8, 16, 32];
+const BARS_OPT = [8, 16, 32, 64];
+
+const TICKS_PER_BAR = 8;
+const STEPS_PER_TICK = 2;
+const MAX_SONG_BARS = 64;
+const MAX_SONG_TICKS = MAX_SONG_BARS * TICKS_PER_BAR;
+
+const SEQ_SNAPS = [
+  { ticks: 8, beats: 4,   label: "1 BAR (4B)",   short: "1 BAR" },
+  { ticks: 4, beats: 2,   label: "1/2 BAR (2B)", short: "2 BEATS" },
+  { ticks: 2, beats: 1,   label: "1 BEAT",       short: "1 BEAT" },
+  { ticks: 1, beats: 0.5, label: "1/2 BEAT",     short: "1/2 BT" }
+];
+
+const TRK_COLS = ["#00f0ff", "#ff2a85", "#00ff88", "#ffaa00", "#aa66ff", "#ff5555", "#44aaff", "#ddff33"];
+const PAT_COLS = ["#00f0ff", "#ff2a85", "#00ff88", "#ffaa00", "#bb66ff", "#ff5555", "#55ccff", "#e8ff44"];
+const logMap = (v, min, max) => min * Math.pow(max / min, v);
+
+// ==========================================
+// 2. APPLICATION STATE
+// ==========================================
+function makePad(idx) {
+  return {
+    idx, name: "EMPTY", rawBuf: null, bakedBuf: null, miniPeaks: null, dirty: true,
+    grd: 1, sr: 15625, pt: 1, drv: 1.3, st: 0, en: 1, lockSE: false,
+    loop: true, bypass: false, beats: 4, tgtBpm: 90,
+    fMode: 0, fCutNorm: 0.65, fCutHz: 1900, fRes: 0.55,
+    rmOn: false, rmFreqNorm: 0.45, rmFreqHz: 180, rmMix: 0.7,
+    dlOn: false, dlTime: 0.28, dlAmt: 0.45,
+    lastTrigTime: -1, lastTrigRate: 1,
+    trigs: []
+  };
+}
+const pads = Array.from({ length: 8 }, (_, i) => makePad(i));
+let activePad = 0;
+let activeTab = "pads";
+
+const stepPats = Array.from({ length: 8 }, () => Array.from({ length: 8 }, () => new Uint8Array(16)));
+const stepPitches = Array.from({ length: 8 }, () => Array.from({ length: 8 }, () => new Int8Array(16)));
+let activeStepPat = 0, stepClip = null, stepPitchClip = null, stepSwing = 0;
+let stepEditMode = "trig";
+let stepRunning = false, stepTimer = 0, stepCur = 0, stepNextTime = 0, stepDrawCur = -1;
+
+function makeSeqTrack(mode, padIdx) {
+  return {
+    mode, padIdx: padIdx || 0, vol: 0.85, mute: false,
+    cells: new Uint8Array(MAX_SONG_TICKS),
+    vuPeak: 0, vuLevel: 0
+  };
+}
+let seqTracks = [
+  makeSeqTrack("loop", 0), makeSeqTrack("loop", 1), makeSeqTrack("loop", 2), makeSeqTrack("loop", 3),
+  makeSeqTrack("loop", 4), makeSeqTrack("loop", 5), makeSeqTrack("step", 0), makeSeqTrack("step", 0)
+];
+let seqBrushPat = 1, seqBpm = 90, seqBars = 16;
+let seqSnapIdx = 2;
+let seqTool = "paint";
+let seqSel = null;
+let seqClipboard = null;
+let seqPasteAnchor = null;
+let seqLoopOn = true, seqLoopStart = 0, seqLoopEnd = 16;
+let seqZoom = 1, seqScroll = 0;
+let seqRunning = false, seqTimer = 0, seqStepIdx = 0, seqNextStepTime = 0;
+let seqHeadStep = 0, seqHeadTime = 0, seqScrubStep = 0;
+
+let treeRoots = [], treeFlat = [], treeScroll = 0, treeAudName = "";
+let viewZoom = 1, viewOffset = 0, edPlaying = false, readPos = 0;
+
+let mx = 0, my = 0, down = false;
+let activeSlider = null, activeDrag = null, pressedBtnId = null;
+let lastClick = { t: 0, key: "" };
+let statusMsg = "READY // REAL-TIME SP-202 DSP & FX ACTIVE ON ALL TRACKS";
+
+// Dropdown Menu State
+let openMenu = null; // null | "file" | "edit"
+let menuBtnRects = {};
+let menuItemRects = [];
+let menuPanelRect = null;
+
+// Undo / Redo History
+const MAX_UNDO = 60;
+const undoStack = [];
+const redoStack = [];
+
+// Offscreen Caches
+const bgCv = document.createElement("canvas"), bgCtx = bgCv.getContext("2d");
+const ovWfCv = document.createElement("canvas"), ovWfCtx = ovWfCv.getContext("2d");
+const wfCv = document.createElement("canvas"), wfCtx = wfCv.getContext("2d");
+const seqCacheCv = document.createElement("canvas"), seqCacheCtx = seqCacheCv.getContext("2d");
+let waveCacheDirty = true, ovCacheDirty = true, seqCacheDirty = true;
+let rafId = 0, needRedraw = true;
+
+// Immediate-Mode UI Registry
+let uiBtns = [], uiSliders = [], dropZones = [];
+let waveRect = null, ovRect = null, hScrRect = null, hThumbRect = null;
+let treeListRect = null, treeThumbRect = null, stepGridRect = null;
+let seqGridRect = null, seqLoopRect = null, seqScrubRect = null, seqHScrRect = null, seqHThumbRect = null;
+
+// ==========================================
+// 3. UNDO / REDO ENGINE
+// ==========================================
+function captureState(label) {
+  return {
+    label,
+    pads: pads.map(p => ({
+      name: p.name, grd: p.grd, sr: p.sr, pt: p.pt, drv: p.drv, st: p.st, en: p.en, lockSE: p.lockSE,
+      loop: p.loop, bypass: p.bypass, beats: p.beats, tgtBpm: p.tgtBpm,
+      fMode: p.fMode, fCutNorm: p.fCutNorm, fCutHz: p.fCutHz, fRes: p.fRes,
+      rmOn: p.rmOn, rmFreqNorm: p.rmFreqNorm, rmFreqHz: p.rmFreqHz, rmMix: p.rmMix,
+      dlOn: p.dlOn, dlTime: p.dlTime, dlAmt: p.dlAmt,
+      rawBuf: p.rawBuf
+    })),
+    stepPats: stepPats.map(pat => pat.map(r => new Uint8Array(r))),
+    stepPitches: stepPitches.map(pat => pat.map(r => new Int8Array(r))),
+    stepSwing,
+    seqTracks: seqTracks.map(t => ({
+      mode: t.mode, padIdx: t.padIdx, vol: t.vol, mute: t.mute,
+      cells: new Uint8Array(t.cells)
+    })),
+    seqBpm, seqBars, seqLoopOn, seqLoopStart, seqLoopEnd,
+    seqSel: seqSel ? { ...seqSel } : null
+  };
+}
+
+function restoreState(snap) {
+  snap.pads.forEach((sp, i) => {
+    const p = pads[i];
+    const changed = p.rawBuf !== sp.rawBuf || p.grd !== sp.grd || p.sr !== sp.sr || p.pt !== sp.pt ||
+      p.drv !== sp.drv || p.st !== sp.st || p.en !== sp.en || p.bypass !== sp.bypass ||
+      p.fMode !== sp.fMode || p.fCutHz !== sp.fCutHz || p.fRes !== sp.fRes ||
+      p.rmOn !== sp.rmOn || p.rmFreqHz !== sp.rmFreqHz || p.rmMix !== sp.rmMix ||
+      p.dlOn !== sp.dlOn || p.dlTime !== sp.dlTime || p.dlAmt !== sp.dlAmt;
+    Object.assign(p, sp);
+    if (changed) p.dirty = true;
+    if (!p.rawBuf) { p.bakedBuf = null; p.miniPeaks = null; }
+    else if (!p.miniPeaks) p.miniPeaks = computeMiniPeaks(p.rawBuf);
+  });
+  for (let i = 0; i < 8; i++) {
+    for (let j = 0; j < 8; j++) {
+      stepPats[i][j].set(snap.stepPats[i][j]);
+      stepPitches[i][j].set(snap.stepPitches[i][j]);
+    }
+  }
+  stepSwing = snap.stepSwing;
+
+  stopAllVoices(false);
+  seqTracks = snap.seqTracks.map(st => {
+    const t = makeSeqTrack(st.mode, st.padIdx);
+    t.vol = st.vol; t.mute = st.mute; t.cells.set(st.cells);
+    return t;
+  });
+  seqBpm = snap.seqBpm;
+  seqBars = snap.seqBars;
+  seqLoopOn = snap.seqLoopOn;
+  seqLoopStart = snap.seqLoopStart;
+  seqLoopEnd = snap.seqLoopEnd;
+  seqSel = snap.seqSel ? { ...snap.seqSel } : null;
+
+  ovCacheDirty = waveCacheDirty = seqCacheDirty = true;
+  requestDraw();
+}
+
+function pushUndo(label) {
+  undoStack.push(captureState(label));
+  if (undoStack.length > MAX_UNDO) undoStack.shift();
+  redoStack.length = 0;
+}
+
+function doUndo() {
+  if (!undoStack.length) { statusMsg = "NOTHING TO UNDO"; requestDraw(); return; }
+  const prev = undoStack.pop();
+  redoStack.push(captureState(prev.label));
+  restoreState(prev);
+  statusMsg = `UNDO: ${prev.label}`;
+  requestDraw();
+}
+
+function doRedo() {
+  if (!redoStack.length) { statusMsg = "NOTHING TO REDO"; requestDraw(); return; }
+  const next = redoStack.pop();
+  undoStack.push(captureState(next.label));
+  restoreState(next);
+  statusMsg = `REDO: ${next.label}`;
+  requestDraw();
+}
+
+// ==========================================
+// 4. PROJECT SAVE / LOAD / NEW
+// ==========================================
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onloadend = () => resolve(String(r.result).split(",")[1] || "");
+    r.onerror = reject;
+    r.readAsDataURL(blob);
+  });
+}
+
+function base64ToArrayBuffer(b64) {
+  const bin = atob(b64);
+  const len = bin.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+
+async function saveProject() {
+  statusMsg = "SAVING PROJECT..."; requestDraw();
+  const padData = [];
+  for (let i = 0; i < 8; i++) {
+    const p = pads[i];
+    let audioB64 = null;
+    if (p.rawBuf) {
+      audioB64 = await blobToBase64(encodeWavBlob(p.rawBuf));
+    }
+    padData.push({
+      name: p.name, grd: p.grd, sr: p.sr, pt: p.pt, drv: p.drv, st: p.st, en: p.en, lockSE: p.lockSE,
+      loop: p.loop, bypass: p.bypass, beats: p.beats, tgtBpm: p.tgtBpm,
+      fMode: p.fMode, fCutNorm: p.fCutNorm, fCutHz: p.fCutHz, fRes: p.fRes,
+      rmOn: p.rmOn, rmFreqNorm: p.rmFreqNorm, rmFreqHz: p.rmFreqHz, rmMix: p.rmMix,
+      dlOn: p.dlOn, dlTime: p.dlTime, dlAmt: p.dlAmt,
+      audioB64
+    });
+  }
+  const proj = {
+    version: 1,
+    seqBpm, seqBars, seqLoopOn, seqLoopStart, seqLoopEnd, stepSwing,
+    pads: padData,
+    stepPats: stepPats.map(pat => pat.map(r => Array.from(r))),
+    stepPitches: stepPitches.map(pat => pat.map(r => Array.from(r))),
+    seqTracks: seqTracks.map(t => ({
+      mode: t.mode, padIdx: t.padIdx, vol: t.vol, mute: t.mute,
+      cells: Array.from(t.cells)
+    }))
+  };
+  const blob = new Blob([JSON.stringify(proj)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `SP202_PROJECT_${seqBpm}BPM.sp202.json`;
+  a.click();
+  statusMsg = `PROJECT SAVED (${seqBpm} BPM)`; requestDraw();
+}
+
+async function loadProjectFile(file) {
+  if (!file) return;
+  try {
+    initAudio(); stopAllAudio();
+    pushUndo("Load Project");
+    const proj = JSON.parse(await file.text());
+    seqBpm = proj.seqBpm || 90;
+    seqBars = proj.seqBars || 16;
+    seqLoopOn = proj.seqLoopOn !== undefined ? proj.seqLoopOn : true;
+    seqLoopStart = proj.seqLoopStart || 0;
+    seqLoopEnd = proj.seqLoopEnd || seqBars;
+    stepSwing = proj.stepSwing || 0;
+
+    if (proj.pads) {
+      for (let i = 0; i < 8; i++) {
+        const sp = proj.pads[i];
+        const p = pads[i];
+        Object.assign(p, makePad(i), sp);
+        p.rawBuf = null; p.bakedBuf = null; p.miniPeaks = null; p.dirty = true;
+        if (sp.audioB64) {
+          p.rawBuf = await ac.decodeAudioData(base64ToArrayBuffer(sp.audioB64));
+          p.miniPeaks = computeMiniPeaks(p.rawBuf);
+        }
+      }
+    }
+    if (proj.stepPats) {
+      for (let i = 0; i < 8; i++) for (let j = 0; j < 8; j++) stepPats[i][j].set(proj.stepPats[i][j]);
+    }
+    if (proj.stepPitches) {
+      for (let i = 0; i < 8; i++) for (let j = 0; j < 8; j++) stepPitches[i][j].set(proj.stepPitches[i][j]);
+    }
+    if (proj.seqTracks) {
+      seqTracks = proj.seqTracks.map(st => {
+        const t = makeSeqTrack(st.mode, st.padIdx);
+        t.vol = st.vol; t.mute = st.mute; t.cells.set(st.cells.slice(0, MAX_SONG_TICKS));
+        return t;
+      });
+    }
+    seqSel = null; seqPasteAnchor = null;
+    ovCacheDirty = waveCacheDirty = seqCacheDirty = true;
+    statusMsg = `LOADED PROJECT: ${file.name}`;
+    requestDraw();
+  } catch (err) {
+    statusMsg = "PROJECT LOAD ERROR"; requestDraw();
+  }
+}
+
+function newProject() {
+  stopAllAudio();
+  pushUndo("New Project");
+  for (let i = 0; i < 8; i++) Object.assign(pads[i], makePad(i));
+  for (let i = 0; i < 8; i++) for (let j = 0; j < 8; j++) { stepPats[i][j].fill(0); stepPitches[i][j].fill(0); }
+  seqTracks = [
+    makeSeqTrack("loop", 0), makeSeqTrack("loop", 1), makeSeqTrack("loop", 2), makeSeqTrack("loop", 3),
+    makeSeqTrack("loop", 4), makeSeqTrack("loop", 5), makeSeqTrack("step", 0), makeSeqTrack("step", 0)
+  ];
+  seqBpm = 90; seqBars = 16; seqLoopOn = true; seqLoopStart = 0; seqLoopEnd = 16; stepSwing = 0;
+  seqSel = null; seqPasteAnchor = null;
+  ovCacheDirty = waveCacheDirty = seqCacheDirty = true;
+  statusMsg = "NEW PROJECT CREATED"; requestDraw();
+}
+
+projIn.onchange = e => { if (e.target.files[0]) loadProjectFile(e.target.files[0]); projIn.value = ""; };
+
+// ==========================================
+// 5. REAL-TIME WEB AUDIO & SP-202 DSP ENGINE
+// ==========================================
+let ac, proc, treeAudSrc = null;
+function makeChState(maxDly) {
+  return {
+    lp: 0, dac: 0, hold: 0, lastIdx: -1,
+    l1: 0, l2: 0, l3: 0, l4: 0,
+    s1L: 0, s1B: 0, s2L: 0, s2B: 0, rmPhase: 0,
+    dBuf: maxDly ? new Float32Array(maxDly) : null, dIdx: 0, dLp: 0
+  };
+}
+let chState = [makeChState(0), makeChState(0)];
+let padDsp = [];
+let liveVoices = [];
+
+function resetChPair(pair, clearDelay) {
+  for (let i = 0; i < 2; i++) {
+    const s = pair[i];
+    if (!s) continue;
+    s.lp = s.dac = s.hold = s.l1 = s.l2 = s.l3 = s.l4 = s.s1L = s.s1B = s.s2L = s.s2B = s.rmPhase = 0;
+    s.lastIdx = -1;
+    if (clearDelay && s.dBuf) { s.dBuf.fill(0); s.dIdx = 0; s.dLp = 0; }
+  }
+}
+
+function resetDspState(clearDelay) {
+  resetChPair(chState, clearDelay);
+}
+
+function stopVoiceByOwner(ownerKey, when) {
+  const t = when || (ac ? ac.currentTime : 0);
+  for (let i = liveVoices.length - 1; i >= 0; i--) {
+    const v = liveVoices[i];
+    if (v.ownerKey === ownerKey) {
+      if (!when) liveVoices.splice(i, 1);
+      else if (v.stopTime > t) v.stopTime = t;
+    }
+  }
+}
+
+function stopAllVoices(clearDelay) {
+  liveVoices.length = 0;
+  if (clearDelay && padDsp.length) {
+    for (let p = 0; p < 8; p++) resetChPair(padDsp[p], true);
+  }
+}
+
+function spawnVoice(padIdx, trackIdx, ownerKey, startTime, isLoop, rate) {
+  const pad = pads[padIdx];
+  if (!pad || !pad.rawBuf) return null;
+  initAudio();
+  if (ac.state === "suspended") ac.resume();
+  const t = startTime || ac.currentTime;
+  if (ownerKey) stopVoiceByOwner(ownerKey, t);
+  const v = {
+    padIdx,
+    trackIdx,
+    ownerKey,
+    startTime: t,
+    stopTime: Infinity,
+    pos: Math.floor(pad.rawBuf.length * pad.st),
+    loop: !!isLoop,
+    rate: rate || 1,
+    started: false,
+    done: false
+  };
+  liveVoices.push(v);
+  return v;
+}
+
+function getDspCoeffs(pad, outSR) {
+  const g = G[pad.grd], targetSR = pad.sr;
+  const qScale = Math.min(1, Math.max(0, (targetSR - 3906.25) / (31250 - 3906.25)));
+  const bits = Math.round(g.bits * 0.65 + (7 + qScale * 5) * 0.35);
+  const levels = (1 << (bits - 1)) - 1;
+  const mu = g.mu, logMu = Math.log(1 + mu);
+  const normDrive = Math.tanh(pad.drv);
+  const autoMakeup = g.makeup * (1 + (1 - qScale) * 0.18);
+
+  const fcPre = Math.min(outSR * 0.45, Math.max(1400, targetSR * 0.48 * g.pre));
+  const aPre = 1 - Math.exp(-2 * Math.PI * fcPre / outSR);
+  const fcPost = Math.min(outSR * 0.45, Math.max(1500, targetSR * pad.pt * 0.56 * g.post));
+  const aPost = 1 - Math.exp(-2 * Math.PI * fcPost / outSR);
+
+  const fs2 = outSR * 2, fcClamped = Math.min(outSR * 0.42, Math.max(35, pad.fCutHz));
+  const lpfG = Math.min(0.76, 1 - Math.exp(-2 * Math.PI * fcClamped / fs2));
+  const lpfK = pad.fRes * 3.82, lpfComp = 1 + pad.fRes * 0.72;
+  const svfF = Math.min(0.82, 2 * Math.sin(Math.PI * fcClamped / fs2));
+  const svfQ = Math.max(0.14, 1.05 - pad.fRes * 0.91);
+  const rmInc = (2 * Math.PI * pad.rmFreqHz) / outSR;
+
+  const dlSamples = Math.max(1, Math.floor(pad.dlTime * outSR));
+  const dlFb = pad.dlAmt * 0.78, dlWet = pad.dlAmt * 0.85;
+  const dlA = 1 - Math.exp(-2 * Math.PI * 3800 / outSR);
+
+  return { g, targetSR, bits, levels, mu, logMu, normDrive, autoMakeup, aPre, aPost, lpfG, lpfK, lpfComp, svfF, svfQ, rmInc, dlSamples, dlFb, dlWet, dlA };
+}
+
+function step202AndFx(sample, st, storedIdx, pad, c, useDelay) {
+  let y = sample;
+  if (!pad.bypass) {
+    st.lp += c.aPre * (sample - st.lp);
+    if (storedIdx !== st.lastIdx) {
+      st.lastIdx = storedIdx;
+      let s = (Math.tanh((st.lp + 0.015) * pad.drv) - Math.tanh(0.015 * pad.drv)) / c.normDrive;
+      s += (Math.random() - Math.random()) * c.g.hiss;
+      s = Math.max(-1, Math.min(1, s));
+      const comp = Math.sign(s) * Math.log(1 + c.mu * Math.abs(s)) / c.logMu;
+      const q = Math.round(comp * c.levels) / c.levels;
+      st.hold = Math.sign(q) * (Math.pow(1 + c.mu, Math.abs(q)) - 1) / c.mu;
+    }
+    st.dac += c.aPost * (st.hold - st.dac);
+    y = Math.tanh(st.dac * c.autoMakeup * 0.95) / 0.74;
+  }
+  if (pad.fMode === 1) {
+    for (let k = 0; k < 2; k++) {
+      const fb = Math.tanh(st.l4 * 1.35);
+      const u = Math.tanh((y * c.lpfComp - c.lpfK * fb) * 1.25);
+      st.l1 += c.lpfG * (u - st.l1); st.l2 += c.lpfG * (st.l1 - st.l2);
+      st.l3 += c.lpfG * (st.l2 - st.l3); st.l4 += c.lpfG * (st.l3 - st.l4);
+    }
+    y = Math.tanh(st.l4 * 1.15);
+  } else if (pad.fMode === 2) {
+    let hp2 = y; const driveIn = y * (1 + pad.fRes * 0.45);
+    for (let k = 0; k < 2; k++) {
+      const hp1 = driveIn - st.s1L - c.svfQ * st.s1B;
+      st.s1B = Math.tanh((st.s1B + c.svfF * hp1) * 1.05); st.s1L += c.svfF * st.s1B;
+      hp2 = hp1 - st.s2L - c.svfQ * st.s2B;
+      st.s2B = Math.tanh((st.s2B + c.svfF * hp2) * 1.05); st.s2L += c.svfF * st.s2B;
+    }
+    y = Math.tanh(hp2 * 0.95);
+  } else if (pad.fMode === 3) {
+    const driveIn = y * (1.2 + pad.fRes * 0.6);
+    for (let k = 0; k < 2; k++) {
+      const hp1 = driveIn - st.s1L - c.svfQ * st.s1B;
+      st.s1B = Math.tanh(st.s1B + c.svfF * hp1); st.s1L += c.svfF * st.s1B;
+      const hp2 = st.s1B - st.s2L - c.svfQ * st.s2B;
+      st.s2B = Math.tanh(st.s2B + c.svfF * hp2); st.s2L += c.svfF * st.s2B;
+    }
+    y = Math.tanh(st.s2B * 1.35);
+  }
+  if (pad.rmOn) {
+    st.rmPhase += c.rmInc;
+    if (st.rmPhase > 6.2831853) st.rmPhase -= 6.2831853;
+    y = y * (1 - pad.rmMix) + (y * Math.sin(st.rmPhase)) * pad.rmMix;
+  }
+  if (useDelay && pad.dlOn && pad.dlAmt > 0 && st.dBuf) {
+    const bLen = st.dBuf.length;
+    let rIdx = st.dIdx - c.dlSamples; if (rIdx < 0) rIdx += bLen;
+    const delayed = st.dBuf[rIdx];
+    st.dLp += c.dlA * (delayed - st.dLp);
+    st.dBuf[st.dIdx] = Math.tanh(y + st.dLp * c.dlFb);
+    st.dIdx = (st.dIdx + 1) % bLen;
+    y = y + delayed * c.dlWet;
+  }
+  return Math.max(-1, Math.min(1, y));
+}
+
+function initAudio() {
+  if (ac) return;
+  ac = new (window.AudioContext || window.webkitAudioContext)();
+  const maxDly = Math.ceil(ac.sampleRate * 1.1);
+  chState = [makeChState(maxDly), makeChState(maxDly)];
+  padDsp = Array.from({ length: 8 }, () => [makeChState(maxDly), makeChState(maxDly)]);
+
+  proc = ac.createScriptProcessor(1024, 0, 2);
+  proc.onaudioprocess = e => {
+    const outL = e.outputBuffer.getChannelData(0), outR = e.outputBuffer.getChannelData(1);
+    const len = outL.length, outSR = ac.sampleRate;
+    const blockStart = e.playbackTime || ac.currentTime;
+    const invSR = 1 / outSR;
+    outL.fill(0); outR.fill(0);
+
+    // 1. Wave Editor Preview Voice (Real-Time)
+    if (activeTab === "edit" && edPlaying) {
+      const pad = pads[activePad];
+      if (pad && pad.rawBuf) {
+        const rawBuf = pad.rawBuf, inSR = rawBuf.sampleRate;
+        const s0 = Math.floor(rawBuf.length * pad.st), s1 = Math.max(s0 + 2, Math.floor(rawBuf.length * pad.en));
+        const inL = rawBuf.getChannelData(0), inR = rawBuf.numberOfChannels > 1 ? rawBuf.getChannelData(1) : inL;
+        const step = pad.pt * (inSR / outSR), srRatio = pad.sr / inSR;
+        const c = getDspCoeffs(pad, outSR);
+        for (let i = 0; i < len; i++) {
+          let xL = 0, xR = 0, storedIdx = -1;
+          if (edPlaying) {
+            if (readPos < s0) readPos = s0;
+            if (readPos >= s1) {
+              if (pad.loop) { readPos = s0; resetDspState(false); }
+              else edPlaying = false;
+            }
+            if (edPlaying) {
+              const i0 = Math.floor(readPos), frac = readPos - i0, i1 = Math.min(s1 - 1, i0 + 1);
+              xL = inL[i0] + (inL[i1] - inL[i0]) * frac;
+              xR = inR[i0] + (inR[i1] - inR[i0]) * frac;
+              storedIdx = Math.floor(readPos * srRatio);
+              readPos += step;
+            }
+          }
+          if (edPlaying || (pad.dlOn && pad.dlAmt > 0)) {
+            outL[i] += step202AndFx(xL, chState[0], storedIdx, pad, c, true);
+            outR[i] += step202AndFx(xR, chState[1], storedIdx, pad, c, true);
+          }
+        }
+      }
+    }
+
+    // 2. Real-Time Multi-Voice Engine (Song Timeline, Step Sequencer, Pad Matrix)
+    if (liveVoices.length || pads.some(p => p.dlOn && p.dlAmt > 0)) {
+      const trkPeaks = new Float32Array(seqTracks.length);
+
+      for (let p = 0; p < 8; p++) {
+        const pad = pads[p];
+        if (!pad.rawBuf) continue;
+
+        // Collect voices belonging to this pad
+        let pVoices = null;
+        for (let vi = 0; vi < liveVoices.length; vi++) {
+          if (liveVoices[vi].padIdx === p && !liveVoices[vi].done) {
+            if (!pVoices) pVoices = [];
+            pVoices.push(liveVoices[vi]);
+          }
+        }
+        const hasDelay = pad.dlOn && pad.dlAmt > 0;
+        if (!pVoices && !hasDelay) continue;
+
+        const rawBuf = pad.rawBuf, inSR = rawBuf.sampleRate;
+        const s0 = Math.floor(rawBuf.length * pad.st), s1 = Math.max(s0 + 2, Math.floor(rawBuf.length * pad.en));
+        const inL = rawBuf.getChannelData(0), inR = rawBuf.numberOfChannels > 1 ? rawBuf.getChannelData(1) : inL;
+        const srRatio = pad.sr / inSR;
+        const c = getDspCoeffs(pad, outSR);
+        const dspL = padDsp[p][0], dspR = padDsp[p][1];
+
+        for (let i = 0; i < len; i++) {
+          const t = blockStart + i * invSR;
+          let xL = 0, xR = 0, storedIdx = -1;
+          let gain = 1, activeTrk = -1, anyActive = false;
+
+          if (pVoices) {
+            for (let vi = 0; vi < pVoices.length; vi++) {
+              const v = pVoices[vi];
+              if (v.done) continue;
+              if (t >= v.stopTime) { v.done = true; continue; }
+              if (t < v.startTime) continue;
+
+              if (!v.started) {
+                v.started = true;
+                v.pos = s0;
+                resetChPair(padDsp[p], false);
+              }
+              if (v.pos < s0) v.pos = s0;
+              if (v.pos >= s1) {
+                if (v.loop) { v.pos = s0; resetChPair(padDsp[p], false); }
+                else { v.done = true; continue; }
+              }
+
+              const i0 = Math.floor(v.pos), frac = v.pos - i0, i1 = Math.min(s1 - 1, i0 + 1);
+              xL += inL[i0] + (inL[i1] - inL[i0]) * frac;
+              xR += inR[i0] + (inR[i1] - inR[i0]) * frac;
+              storedIdx = Math.floor(v.pos * srRatio);
+              v.pos += pad.pt * v.rate * (inSR / outSR);
+              anyActive = true;
+
+              if (v.trackIdx >= 0 && v.trackIdx < seqTracks.length) {
+                const trk = seqTracks[v.trackIdx];
+                gain = trk.mute ? 0 : trk.vol;
+                activeTrk = v.trackIdx;
+              } else {
+                gain = 1;
+                activeTrk = -1;
+              }
+            }
+          }
+
+          if (anyActive || hasDelay) {
+            const yL = step202AndFx(xL, dspL, storedIdx, pad, c, true) * gain;
+            const yR = step202AndFx(xR, dspR, storedIdx, pad, c, true) * gain;
+            outL[i] += yL;
+            outR[i] += yR;
+            if (activeTrk >= 0) {
+              const pk = Math.max(Math.abs(yL), Math.abs(yR));
+              if (pk > trkPeaks[activeTrk]) trkPeaks[activeTrk] = pk;
+            }
+          }
+        }
+      }
+
+      // Update per-track VU peaks & prune finished voices
+      for (let t = 0; t < seqTracks.length; t++) seqTracks[t].vuPeak = trkPeaks[t];
+      let w = 0;
+      for (let i = 0; i < liveVoices.length; i++) {
+        if (!liveVoices[i].done) liveVoices[w++] = liveVoices[i];
+      }
+      liveVoices.length = w;
+    }
+
+    // Master soft-clip
+    for (let i = 0; i < len; i++) {
+      outL[i] = Math.tanh(outL[i]);
+      outR[i] = Math.tanh(outR[i]);
+    }
+  };
+  proc.connect(ac.destination);
+}
+
+function computeMiniPeaks(buf) {
+  const bins = 256, peaks = new Float32Array(bins), d = buf.getChannelData(0);
+  const spp = d.length / bins, stride = Math.max(1, Math.floor(spp / 24));
+  for (let b = 0; b < bins; b++) {
+    const s = Math.floor(b * spp), e = Math.min(d.length, Math.max(s + 1, Math.floor((b + 1) * spp)));
+    let mx = 0;
+    for (let i = s; i < e; i += stride) { const v = Math.abs(d[i]); if (v > mx) mx = v; }
+    peaks[b] = mx;
+  }
+  return peaks;
+}
+
+function ensurePadBuffer(pad, includeDelayTail) {
+  if (!pad.rawBuf) return null;
+  initAudio();
+  if (!pad.dirty && pad.bakedBuf && !includeDelayTail) return pad.bakedBuf;
+  const rawBuf = pad.rawBuf, inSR = rawBuf.sampleRate, outSR = ac.sampleRate, nc = rawBuf.numberOfChannels;
+  const s0 = Math.floor(rawBuf.length * pad.st), s1 = Math.max(s0 + 2, Math.floor(rawBuf.length * pad.en));
+  const step = pad.pt * (inSR / outSR), dryLen = Math.max(1, Math.floor((s1 - s0) / step));
+  const tailSec = (includeDelayTail && pad.dlOn && pad.dlAmt > 0) ? Math.min(2.5, pad.dlTime * (1.5 + pad.dlAmt * 3)) : 0;
+  const outLen = dryLen + Math.floor(tailSec * outSR), srRatio = pad.sr / inSR;
+  const c = getDspCoeffs(pad, outSR);
+  const buf = ac.createBuffer(nc, outLen, outSR);
+  const chIn = Array.from({ length: nc }, (_, ch) => rawBuf.getChannelData(ch));
+  const chOut = Array.from({ length: nc }, (_, ch) => buf.getChannelData(ch));
+  const stExp = Array.from({ length: nc }, () => makeChState(Math.ceil(outSR * 1.1)));
+
+  let pos = s0;
+  for (let i = 0; i < outLen; i++) {
+    const inR = i < dryLen;
+    const i0 = inR ? Math.min(s1 - 1, Math.floor(pos)) : 0, i1 = inR ? Math.min(s1 - 1, i0 + 1) : 0;
+    const frac = inR ? pos - i0 : 0, storedIdx = inR ? Math.floor(pos * srRatio) : -1;
+    for (let ch = 0; ch < nc; ch++) {
+      const x = inR ? chIn[ch][i0] + (chIn[ch][i1] - chIn[ch][i0]) * frac : 0;
+      chOut[ch][i] = step202AndFx(x, stExp[ch], storedIdx, pad, c, true);
+    }
+    if (inR) pos += step;
+  }
+  if (!includeDelayTail) { pad.bakedBuf = buf; pad.miniPeaks = computeMiniPeaks(buf); pad.dirty = false; }
+  return buf;
+}
+
+const getPadOrigBpm = pad => pad.rawBuf ? (pad.beats * 60) / Math.max(0.01, pad.rawBuf.duration * (pad.en - pad.st)) : 0;
+const getPadOutDur = pad => pad.rawBuf ? (pad.rawBuf.duration * (pad.en - pad.st)) / pad.pt : 0;
+
+function getClipSpanTicks(trk) {
+  if (trk.mode === "step") return TICKS_PER_BAR;
+  const dur = getPadOutDur(pads[trk.padIdx]);
+  const barDur = 240 / seqBpm;
+  if (dur <= 0) return SEQ_SNAPS[seqSnapIdx].ticks;
+  return Math.max(1, Math.ceil((dur / barDur) * TICKS_PER_BAR - 0.02));
+}
+
+function findClipAtTick(trk, targetK) {
+  const maxK = seqBars * TICKS_PER_BAR;
+  const naturalTicks = getClipSpanTicks(trk);
+  for (let k = Math.min(targetK, maxK - 1); k >= 0; k--) {
+    if (trk.cells[k]) {
+      let nextK = maxK;
+      for (let nk = k + 1; nk < maxK; nk++) {
+        if (trk.cells[nk]) { nextK = nk; break; }
+      }
+      const endK = Math.min(nextK, k + naturalTicks);
+      if (targetK >= k && targetK < endK) {
+        return { startK: k, endK, spanTicks: Math.max(1, endK - k), val: trk.cells[k] };
+      }
+      break;
+    }
+  }
+  return null;
+}
+
+function fitPadToBpm(pad, targetBpm) {
+  if (!pad.rawBuf) return;
+  const orig = getPadOrigBpm(pad); if (orig <= 0) return;
+  pad.tgtBpm = Math.max(20, Math.min(300, Math.round(targetBpm)));
+  pad.pt = Math.max(0.25, Math.min(2.5, pad.tgtBpm / orig));
+  pad.dirty = true;
+}
+function stepPadSemitone(pad, deltaSt) {
+  pushUndo("Pitch Step");
+  const curSt = Math.round(12 * Math.log2(pad.pt));
+  const nextSt = Math.max(-24, Math.min(16, curSt + deltaSt));
+  pad.pt = Math.max(0.25, Math.min(2.5, Math.pow(2, nextSt / 12)));
+  const orig = getPadOrigBpm(pad); if (orig) pad.tgtBpm = Math.round(orig * pad.pt);
+  pad.dirty = true; waveCacheDirty = seqCacheDirty = true;
+}
+
+function encodeWavBlob(audioBuf) {
+  const nc = audioBuf.numberOfChannels, len = audioBuf.length, sr = audioBuf.sampleRate;
+  const ab = new ArrayBuffer(44 + len * nc * 2), v = new DataView(ab);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, "RIFF"); v.setUint32(4, 36 + len * nc * 2, true); ws(8, "WAVE");
+  ws(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, nc, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * nc * 2, true); v.setUint16(32, nc * 2, true); v.setUint16(34, 16, true);
+  ws(36, "data"); v.setUint32(40, len * nc * 2, true);
+  const chs = Array.from({ length: nc }, (_, c) => audioBuf.getChannelData(c));
+  let p = 44;
+  for (let i = 0; i < len; i++) {
+    for (let c = 0; c < nc; c++) {
+      const y = Math.max(-1, Math.min(1, chs[c][i]));
+      v.setInt16(p, y < 0 ? y * 32768 : y * 32767, true);
+      p += 2;
+    }
+  }
+  return new Blob([ab], { type: "audio/wav" });
+}
+
+function exportActivePadWav() {
+  const pad = pads[activePad];
+  if (!pad || !pad.rawBuf) { statusMsg = "ACTIVE PAD IS EMPTY"; requestDraw(); return; }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(encodeWavBlob(ensurePadBuffer(pad, true)));
+  a.download = `${pad.name}_SP202_${G[pad.grd].name}_${pad.sr}Hz.wav`;
+  a.click();
+  statusMsg = `EXPORTED PAD ${activePad + 1} WAV`; requestDraw();
+}
+
+// ==========================================
+// 6. HARDWARE-SYNCED PAD LED TRACKING & TRANSPORT
+// ==========================================
+function registerPadLed(pad, startTime, dur, isLoop, monoCut) {
+  const d = Math.max(0.05, dur);
+  if (monoCut) {
+    for (let i = 0; i < pad.trigs.length; i++) {
+      if (pad.trigs[i].end > startTime) pad.trigs[i].end = startTime;
+    }
+  }
+  pad.trigs.push({ start: startTime, end: isLoop ? Infinity : startTime + d, loop: isLoop, dur: d });
+  if (pad.trigs.length > 16) pad.trigs.shift();
+  ensureAnim();
+}
+
+function clearPadLeds(pad) { pad.trigs.length = 0; }
+
+function getPadLedState(pad) {
+  if (!ac || !pad.trigs.length) return { lit: false, prog: 0 };
+  const now = ac.currentTime;
+  let w = 0;
+  for (let i = 0; i < pad.trigs.length; i++) if (pad.trigs[i].end > now) pad.trigs[w++] = pad.trigs[i];
+  pad.trigs.length = w;
+  for (let i = pad.trigs.length - 1; i >= 0; i--) {
+    const tr = pad.trigs[i];
+    if (tr.start <= now && now < tr.end) {
+      const elapsed = now - tr.start;
+      return { lit: true, prog: tr.loop ? ((elapsed % tr.dur) / tr.dur) : Math.min(1, elapsed / tr.dur) };
+    }
+  }
+  return { lit: false, prog: 0 };
+}
+
+function stopTreeAudition() { if (treeAudSrc) { try { treeAudSrc.stop(); } catch {} treeAudSrc = null; treeAudName = ""; } }
+async function auditionTreeFile(f, name) {
+  if (!f) return;
+  initAudio(); if (ac.state === "suspended") ac.resume();
+  stopTreeAudition();
+  try {
+    const buf = await ac.decodeAudioData(await f.arrayBuffer());
+    const src = ac.createBufferSource(); src.buffer = buf; src.connect(ac.destination); src.start();
+    treeAudSrc = src; treeAudName = name; statusMsg = `AUDITIONING: ${name}`;
+    src.onended = () => { if (treeAudSrc === src) { treeAudSrc = null; treeAudName = ""; requestDraw(); } };
+    requestDraw();
+  } catch { statusMsg = "DECODE ERROR"; requestDraw(); }
+}
+
+function stopPadNode(pad, when) {
+  stopVoiceByOwner(`pad_${pad.idx}`, when);
+  if (!when) clearPadLeds(pad);
+}
+
+function triggerPad(idx, isScheduled, when, oneShotOverride, rate = 1) {
+  const pad = pads[idx];
+  if (!isScheduled) activePad = idx;
+  if (!pad.rawBuf) return null;
+  initAudio(); if (ac.state === "suspended") ac.resume();
+  const t = when || ac.currentTime;
+  const isLoop = oneShotOverride ? false : pad.loop;
+  const v = spawnVoice(idx, -1, `pad_${idx}`, t, isLoop, rate);
+  pad.lastTrigTime = t; pad.lastTrigRate = rate;
+  registerPadLed(pad, t, getPadOutDur(pad) / rate, isLoop, true);
+  return v;
+}
+
+function startEditorPlay(fromNorm) {
+  const pad = pads[activePad]; if (!pad || !pad.rawBuf) return;
+  initAudio(); if (ac.state === "suspended") ac.resume();
+  stopSeq(); stopStepPat();
+  const s0 = Math.floor(pad.rawBuf.length * pad.st), s1 = Math.floor(pad.rawBuf.length * pad.en);
+  readPos = fromNorm !== undefined ? Math.max(s0, Math.min(s1 - 1, Math.floor(fromNorm * pad.rawBuf.length))) : s0;
+  resetDspState(false); edPlaying = true; ensureAnim();
+}
+function stopEditorPlay() {
+  edPlaying = false; resetDspState(true);
+  const pad = pads[activePad];
+  if (pad && pad.rawBuf) readPos = Math.floor(pad.rawBuf.length * pad.st);
+  requestDraw();
+}
+
+function getSeqPlayheadBarF() {
+  if (!seqRunning || !ac) return seqScrubStep / 16;
+  const stepDur = 60 / seqBpm / 4;
+  let raw = seqHeadStep + (ac.currentTime - seqHeadTime) / stepDur;
+  const ls = seqLoopOn ? Math.round(seqLoopStart * 16) : 0;
+  const le = seqLoopOn ? Math.round(seqLoopEnd * 16) : seqBars * 16;
+  const len = Math.max(2, le - ls);
+  if (seqLoopOn) {
+    if (raw >= le) raw = ls + ((raw - ls) % len);
+    else if (raw < ls) raw = ls;
+  } else {
+    raw = Math.min(seqBars * 16, Math.max(0, raw));
+  }
+  return raw / 16;
+}
+
+function setSeqBpm(newBpm) {
+  if (seqRunning && ac) {
+    seqHeadStep = getSeqPlayheadBarF() * 16;
+    seqHeadTime = ac.currentTime;
+  }
+  seqBpm = Math.max(30, Math.min(240, newBpm));
+  seqCacheDirty = true;
+}
+
+function setSeqBars(newBars) {
+  pushUndo("Change Song Bars");
+  const wasFull = (seqLoopStart === 0 && seqLoopEnd === seqBars);
+  seqBars = newBars;
+  if (wasFull) { seqLoopStart = 0; seqLoopEnd = seqBars; }
+  else {
+    seqLoopEnd = Math.min(seqBars, Math.max(0.25, seqLoopEnd));
+    seqLoopStart = Math.min(seqLoopEnd - 0.125, Math.max(0, seqLoopStart));
+  }
+  seqScrubStep = Math.min(seqBars * 16 - 1, seqScrubStep);
+  clampSeqView();
+  seqCacheDirty = true;
+}
+
+function scrubSeqToBarF(barF) {
+  const snapTicks = SEQ_SNAPS[seqSnapIdx].ticks;
+  const snapSteps = snapTicks * STEPS_PER_TICK;
+  const maxStep = seqBars * 16 - 1;
+  const snappedStep = Math.round((barF * 16) / snapSteps) * snapSteps;
+  const targetStep = Math.max(0, Math.min(maxStep, snappedStep));
+  seqScrubStep = targetStep;
+  if (seqRunning && ac) {
+    stopAllVoices(false);
+    pads.forEach(clearPadLeds);
+    seqStepIdx = targetStep;
+    seqNextStepTime = ac.currentTime + 0.02;
+    seqHeadStep = targetStep;
+    seqHeadTime = seqNextStepTime;
+  }
+  requestDraw();
+}
+
+// ==========================================
+// 7. MARQUEE SELECTION & CLIPBOARD (CTRL+X / C / V / D / A / DEL)
+// ==========================================
+function selectAllTimeline() {
+  seqSel = { t0: 0, t1: seqTracks.length - 1, k0: 0, k1: seqBars * TICKS_PER_BAR };
+  seqCacheDirty = true;
+  statusMsg = `SELECTED ALL (${seqBars} BARS × ${seqTracks.length} TRACKS)`;
+  requestDraw();
+}
+
+function copySeqSelection() {
+  if (!seqSel) { statusMsg = "NOTHING SELECTED // SHIFT+DRAG OR USE [SELECT] BOX FIRST"; requestDraw(); return; }
+  const { t0, t1, k0, k1 } = seqSel;
+  const items = [];
+  for (let t = t0; t <= t1; t++) {
+    const trk = seqTracks[t];
+    if (!trk) continue;
+    for (let k = k0; k < k1; k++) {
+      if (trk.cells[k]) items.push({ dt: t - t0, dk: k - k0, val: trk.cells[k] });
+    }
+  }
+  seqClipboard = {
+    spanTracks: t1 - t0 + 1,
+    spanTicks: Math.max(1, k1 - k0),
+    items
+  };
+  statusMsg = `COPIED ${items.length} CLIP(S) (${(seqClipboard.spanTicks / TICKS_PER_BAR).toFixed(2)} BARS × ${seqClipboard.spanTracks} TRK)`;
+  requestDraw();
+}
+
+function cutSeqSelection() {
+  if (!seqSel) { statusMsg = "NOTHING SELECTED TO CUT"; requestDraw(); return; }
+  copySeqSelection();
+  pushUndo("Cut Selection");
+  const { t0, t1, k0, k1 } = seqSel;
+  for (let t = t0; t <= t1; t++) {
+    if (!seqTracks[t]) continue;
+    for (let k = k0; k < k1; k++) seqTracks[t].cells[k] = 0;
+  }
+  seqCacheDirty = true;
+  statusMsg = `CUT ${seqClipboard ? seqClipboard.items.length : 0} CLIP(S) TO CLIPBOARD`;
+  requestDraw();
+}
+
+function pasteSeqClipboard(atTickOverride, atTrackOverride) {
+  if (!seqClipboard) { statusMsg = "CLIPBOARD EMPTY // SELECT CLIPS & PRESS CTRL+C FIRST"; requestDraw(); return; }
+  pushUndo("Paste Clips");
+  const snapTicks = SEQ_SNAPS[seqSnapIdx].ticks;
+  const playTick = Math.floor((Math.round(getSeqPlayheadBarF() * TICKS_PER_BAR)) / snapTicks) * snapTicks;
+  const baseK = atTickOverride !== undefined ? atTickOverride : (seqPasteAnchor ? seqPasteAnchor.k : playTick);
+  const baseT = atTrackOverride !== undefined ? atTrackOverride : (seqPasteAnchor ? seqPasteAnchor.t : (seqSel ? seqSel.t0 : 0));
+  const maxK = seqBars * TICKS_PER_BAR;
+
+  const endT = Math.min(seqTracks.length - 1, baseT + seqClipboard.spanTracks - 1);
+  const endK = Math.min(maxK, baseK + seqClipboard.spanTicks);
+
+  for (let t = baseT; t <= endT; t++) {
+    for (let k = baseK; k < endK; k++) seqTracks[t].cells[k] = 0;
+  }
+  let pasted = 0;
+  for (const it of seqClipboard.items) {
+    const t = baseT + it.dt, k = baseK + it.dk;
+    if (t >= 0 && t < seqTracks.length && k >= 0 && k < maxK) {
+      seqTracks[t].cells[k] = it.val;
+      pasted++;
+    }
+  }
+  seqSel = { t0: baseT, t1: endT, k0: baseK, k1: endK };
+  const nextK = Math.min(maxK - snapTicks, endK);
+  seqPasteAnchor = { t: baseT, k: nextK };
+  seqScrubStep = nextK * STEPS_PER_TICK;
+  seqCacheDirty = true;
+  statusMsg = `PASTED ${pasted} CLIP(S) AT BAR ${(baseK / TICKS_PER_BAR + 1).toFixed(2)} (PRESS CTRL+V AGAIN TO CHAIN)`;
+  requestDraw();
+}
+
+function duplicateSeqSelection() {
+  if (!seqSel) return;
+  copySeqSelection();
+  pasteSeqClipboard(seqSel.k1, seqSel.t0);
+}
+
+function deleteSeqSelection() {
+  if (!seqSel) return;
+  pushUndo("Delete Selection");
+  const { t0, t1, k0, k1 } = seqSel;
+  for (let t = t0; t <= t1; t++) {
+    if (!seqTracks[t]) continue;
+    for (let k = k0; k < k1; k++) seqTracks[t].cells[k] = 0;
+  }
+  seqCacheDirty = true;
+  statusMsg = "DELETED SELECTED / GROUPED WAVES";
+  requestDraw();
+}
+
+function clearSelectionOrSong() {
+  if (seqSel) {
+    deleteSeqSelection();
+  } else {
+    pushUndo("Clear Entire Song");
+    seqTracks.forEach(t => t.cells.fill(0));
+    seqSel = null;
+    seqCacheDirty = true;
+    statusMsg = "CLEARED ENTIRE SONG TIMELINE (CTRL+Z TO UNDO)";
+    requestDraw();
+  }
+}
+
+function scheduleTimelineStep(globalStep, time, loopStartStep) {
+  const tickIdx = Math.floor(globalStep / STEPS_PER_TICK);
+  const subStep = globalStep % STEPS_PER_TICK;
+  const minTick = Math.floor(loopStartStep / STEPS_PER_TICK);
+  const stepDur = 60 / seqBpm / 4, swOffset = (globalStep % 2 === 1) ? stepSwing * stepDur * 0.33 : 0;
+
+  for (let t = 0; t < seqTracks.length; t++) {
+    const trk = seqTracks[t];
+    if (trk.mode === "loop") {
+      if (subStep === 0 && trk.cells[tickIdx]) {
+        const pad = pads[trk.padIdx]; if (!pad.rawBuf) continue;
+        spawnVoice(trk.padIdx, t, `trk_${t}`, time, false, 1);
+        pad.lastTrigTime = time; pad.lastTrigRate = 1;
+        if (!trk.mute) registerPadLed(pad, time, getPadOutDur(pad), false, true);
+      }
+    } else {
+      let pNum = 0, patStep = 0;
+      for (let d = 0; d < TICKS_PER_BAR; d++) {
+        const k = tickIdx - d;
+        if (k < minTick) break;
+        if (trk.cells[k]) { pNum = trk.cells[k]; patStep = d * STEPS_PER_TICK + subStep; break; }
+      }
+      if (!pNum) continue;
+      const pat = stepPats[pNum - 1], pitches = stepPitches[pNum - 1], trigTime = time + swOffset;
+      for (let p = 0; p < 8; p++) {
+        if (pat[p][patStep]) {
+          const pad = pads[p]; if (!pad.rawBuf) continue;
+          const rate = Math.pow(2, pitches[p][patStep] / 12);
+          spawnVoice(p, t, `trk_${t}_p${p}`, trigTime, false, rate);
+          pad.lastTrigTime = trigTime; pad.lastTrigRate = rate;
+          if (!trk.mute) registerPadLed(pad, trigTime, getPadOutDur(pad) / rate, false, true);
+        }
+      }
+    }
+  }
+}
+
+function seqScheduler() {
+  if (!seqRunning) return;
+  const stepDur = 60 / seqBpm / 4;
+  const ls = seqLoopOn ? Math.round(seqLoopStart * 16) : 0;
+  const le = seqLoopOn ? Math.round(seqLoopEnd * 16) : seqBars * 16;
+  while (seqNextStepTime < ac.currentTime + 0.1) {
+    if (seqStepIdx >= le) {
+      if (seqLoopOn) {
+        seqStepIdx = ls;
+        seqHeadStep = ls;
+        seqHeadTime = seqNextStepTime;
+      } else {
+        stopSeq(); return;
+      }
+    }
+    scheduleTimelineStep(seqStepIdx, seqNextStepTime, ls);
+    seqNextStepTime += stepDur;
+    seqStepIdx++;
+  }
+}
+
+function startSeq() {
+  initAudio(); if (ac.state === "suspended") ac.resume();
+  stopEditorPlay(); stopStepPat(); stopSeq();
+  pads.forEach(p => { p.lastTrigTime = -1; clearPadLeds(p); });
+  const ls = seqLoopOn ? Math.round(seqLoopStart * 16) : 0;
+  const le = seqLoopOn ? Math.round(seqLoopEnd * 16) : seqBars * 16;
+  const startStep = (seqScrubStep >= ls && seqScrubStep < le) ? seqScrubStep : ls;
+  seqRunning = true;
+  seqStepIdx = startStep;
+  seqNextStepTime = ac.currentTime + 0.04;
+  seqHeadStep = startStep;
+  seqHeadTime = seqNextStepTime;
+  seqTimer = setInterval(seqScheduler, 25);
+  ensureAnim();
+}
+
+function stopSeq() {
+  seqRunning = false; clearInterval(seqTimer);
+  stopAllVoices(true);
+  seqTracks.forEach(trk => { trk.vuPeak = 0; trk.vuLevel = 0; });
+  pads.forEach(p => { p.lastTrigTime = -1; clearPadLeds(p); });
+  requestDraw();
+}
+
+function stepScheduler() {
+  if (!stepRunning) return;
+  const stepDur = 60 / seqBpm / 4;
+  while (stepNextTime < ac.currentTime + 0.1) {
+    const s = stepCur, sw = (s % 2 === 1) ? stepSwing * stepDur * 0.33 : 0, t = stepNextTime + sw;
+    const pat = stepPats[activeStepPat], pitches = stepPitches[activeStepPat];
+    for (let p = 0; p < 8; p++) if (pat[p][s] && pads[p].rawBuf) triggerPad(p, true, t, true, Math.pow(2, pitches[p][s] / 12));
+    const delay = Math.max(0, (t - ac.currentTime) * 1000);
+    setTimeout(() => { if (stepRunning && activeTab === "step") { stepDrawCur = s; requestDraw(); } }, delay);
+    stepNextTime += stepDur; stepCur = (stepCur + 1) % 16;
+  }
+}
+function startStepPat() {
+  initAudio(); if (ac.state === "suspended") ac.resume();
+  stopSeq(); stopEditorPlay(); stopStepPat();
+  pads.forEach(p => { p.lastTrigTime = -1; clearPadLeds(p); });
+  stepRunning = true; stepCur = 0; stepNextTime = ac.currentTime + 0.04;
+  stepTimer = setInterval(stepScheduler, 25); ensureAnim();
+}
+function stopStepPat() { stepRunning = false; clearInterval(stepTimer); stepDrawCur = -1; stopAllVoices(true); pads.forEach(clearPadLeds); requestDraw(); }
+function stopAllAudio() {
+  stopTreeAudition(); stopEditorPlay(); stopSeq(); stopStepPat();
+  stopAllVoices(true);
+  pads.forEach(p => { p.lastTrigTime = -1; clearPadLeds(p); });
+  requestDraw();
+}
+
+async function loadFileToPad(idx, f, autoPlay) {
+  if (!f) return;
+  initAudio(); stopTreeAudition();
+  pushUndo(`Load Pad ${idx + 1}`);
+  const pad = pads[idx];
+  pad.name = f.name.replace(/\.[^.]+$/, "");
+  pad.rawBuf = await ac.decodeAudioData(await f.arrayBuffer());
+  pad.st = 0; pad.en = 1; pad.pt = 1; pad.lockSE = false; pad.dirty = true;
+  pad.miniPeaks = computeMiniPeaks(pad.rawBuf);
+  activePad = idx; viewZoom = 1; viewOffset = 0;
+  ovCacheDirty = waveCacheDirty = seqCacheDirty = true;
+  statusMsg = `LOADED "${pad.name}" -> PAD ${idx + 1}`;
+  if (autoPlay && activeTab === "edit") startEditorPlay();
+  requestDraw();
+}
+
+function exportTimelineWav() {
+  initAudio();
+  const sr = ac.sampleRate, barDur = 240 / seqBpm, tickDur = barDur / TICKS_PER_BAR, stepDur = barDur / 16;
+  const kStart = seqLoopOn ? Math.round(seqLoopStart * TICKS_PER_BAR) : 0;
+  const kEnd = seqLoopOn ? Math.round(seqLoopEnd * TICKS_PER_BAR) : seqBars * TICKS_PER_BAR;
+  const spanTicks = Math.max(1, kEnd - kStart);
+  const totalLen = Math.ceil(spanTicks * tickDur * sr);
+  const mixBuf = ac.createBuffer(2, totalLen, sr);
+  const outL = mixBuf.getChannelData(0), outR = mixBuf.getChannelData(1);
+  pads.forEach(p => { if (p.rawBuf) ensurePadBuffer(p, false); });
+
+  for (let t = 0; t < seqTracks.length; t++) {
+    const trk = seqTracks[t]; if (trk.mute) continue;
+    if (trk.mode === "loop") {
+      const pad = pads[trk.padIdx]; if (!pad.bakedBuf) continue;
+      const pL = pad.bakedBuf.getChannelData(0), pR = pad.bakedBuf.numberOfChannels > 1 ? pad.bakedBuf.getChannelData(1) : pL;
+      for (let k = kStart; k < kEnd; k++) {
+        if (!trk.cells[k]) continue;
+        const s0 = Math.floor((k - kStart) * tickDur * sr);
+        let s1 = Math.min(totalLen, s0 + pad.bakedBuf.length);
+        for (let nk = k + 1; nk < kEnd; nk++) if (trk.cells[nk]) { s1 = Math.min(s1, Math.floor((nk - kStart) * tickDur * sr)); break; }
+        for (let i = s0; i < s1; i++) { outL[i] += pL[i - s0] * trk.vol; outR[i] += pR[i - s0] * trk.vol; }
+      }
+    } else {
+      const padTrigs = Array.from({ length: 8 }, () => []);
+      for (let gs = kStart * STEPS_PER_TICK; gs < kEnd * STEPS_PER_TICK; gs++) {
+        const tickIdx = Math.floor(gs / STEPS_PER_TICK), subStep = gs % STEPS_PER_TICK;
+        let pNum = 0, patStep = 0;
+        for (let d = 0; d < TICKS_PER_BAR; d++) {
+          const k = tickIdx - d;
+          if (k < kStart) break;
+          if (trk.cells[k]) { pNum = trk.cells[k]; patStep = d * STEPS_PER_TICK + subStep; break; }
+        }
+        if (!pNum) continue;
+        const pat = stepPats[pNum - 1], pitches = stepPitches[pNum - 1];
+        const sw = (gs % 2 === 1) ? stepSwing * stepDur * 0.33 : 0;
+        const s0 = Math.floor(((gs - kStart * STEPS_PER_TICK) * stepDur + sw) * sr);
+        for (let p = 0; p < 8; p++) if (pat[p][patStep] && pads[p].bakedBuf) padTrigs[p].push({ s0, rate: Math.pow(2, pitches[p][patStep] / 12) });
+      }
+      for (let p = 0; p < 8; p++) {
+        const list = padTrigs[p]; if (!list.length) continue;
+        const pBuf = pads[p].bakedBuf, pL = pBuf.getChannelData(0), pR = pBuf.numberOfChannels > 1 ? pBuf.getChannelData(1) : pL;
+        for (let idx = 0; idx < list.length; idx++) {
+          const { s0, rate } = list[idx], nextS = idx + 1 < list.length ? list[idx + 1].s0 : totalLen;
+          const s1 = Math.min(totalLen, nextS, s0 + Math.floor(pBuf.length / rate));
+          for (let i = s0; i < s1; i++) {
+            const fp = (i - s0) * rate, i0 = Math.floor(fp), frac = fp - i0, i1 = Math.min(pBuf.length - 1, i0 + 1);
+            outL[i] += (pL[i0] + (pL[i1] - pL[i0]) * frac) * trk.vol;
+            outR[i] += (pR[i0] + (pR[i1] - pR[i0]) * frac) * trk.vol;
+          }
+        }
+      }
+    }
+  }
+  for (let i = 0; i < totalLen; i++) { outL[i] = Math.tanh(outL[i]); outR[i] = Math.tanh(outR[i]); }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(encodeWavBlob(mixBuf));
+  a.download = `SP202_SONG_${seqBpm}BPM.wav`; a.click();
+  statusMsg = `EXPORTED SONG WAV (${seqBpm} BPM)`; requestDraw();
+}
+
+// ==========================================
+// 8. SAMPLE TREE DIRECTORY & FLATTENING
+// ==========================================
+function rebuildTreeFlat() {
+  treeFlat = [];
+  const walk = (nodes, depth) => {
+    for (const n of nodes) {
+      n.depth = depth; treeFlat.push(n);
+      if (n.type === "dir" && n.open && n.children) walk(n.children, depth + 1);
+    }
+  };
+  walk(treeRoots, 0); requestDraw();
+}
+async function readDirNodes(handle) {
+  const dirs = [], files = [];
+  for await (const entry of handle.values()) {
+    if (entry.kind === "directory") dirs.push({ type: "dir", name: entry.name, handle: entry, open: false, loaded: false, children: [] });
+    else if (/\.(wav|mp3|ogg|flac|m4a)$/i.test(entry.name)) files.push({ type: "file", name: entry.name, fileFn: () => entry.getFile() });
+  }
+  dirs.sort((a, b) => a.name.localeCompare(b.name)); files.sort((a, b) => a.name.localeCompare(b.name));
+  return [...dirs, ...files];
+}
+async function openSampleFolder() {
+  try {
+    const h = await window.showDirectoryPicker();
+    treeRoots = await readDirNodes(h); treeScroll = 0; rebuildTreeFlat();
+    statusMsg = `FOLDER LOADED (${treeRoots.length} ITEMS)`; requestDraw();
+  } catch {}
+}
+fIn.onchange = e => {
+  treeRoots = Array.from(e.target.files).map(f => ({ type: "file", name: f.name, fileFn: async () => f }));
+  treeScroll = 0; rebuildTreeFlat(); statusMsg = `LOADED ${treeRoots.length} FILE(S)`; requestDraw();
+};
+
+// ==========================================
+// 9. LIQUID GLASS & RUBBER BUTTON PRIMITIVES
+// ==========================================
+function rrect(g, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  g.beginPath();
+  g.moveTo(x + r, y); g.lineTo(x + w - r, y); g.quadraticCurveTo(x + w, y, x + w, y + r);
+  g.lineTo(x + w, y + h - r); g.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  g.lineTo(x + r, y + h); g.quadraticCurveTo(x, y + h, x, y + h - r);
+  g.lineTo(x, y + r); g.quadraticCurveTo(x, y, x + r, y);
+  g.closePath();
+}
+
+function buildBgCache(w, h) {
+  bgCv.width = w; bgCv.height = h;
+  const g = bgCtx;
+  const base = g.createLinearGradient(0, 0, w, h);
+  base.addColorStop(0, "#050912"); base.addColorStop(0.5, "#0a1324"); base.addColorStop(1, "#04070e");
+  g.fillStyle = base; g.fillRect(0, 0, w, h);
+  const orbs = [
+    [w * 0.16, h * 0.22, Math.max(w, h) * 0.34, "rgba(0, 210, 255, 0.13)"],
+    [w * 0.82, h * 0.20, Math.max(w, h) * 0.30, "rgba(255, 42, 133, 0.10)"],
+    [w * 0.55, h * 0.82, Math.max(w, h) * 0.38, "rgba(0, 255, 160, 0.09)"]
+  ];
+  for (const [ox, oy, rad, col] of orbs) {
+    const rg = g.createRadialGradient(ox, oy, 0, ox, oy, rad);
+    rg.addColorStop(0, col); rg.addColorStop(1, "rgba(0,0,0,0)");
+    g.fillStyle = rg; g.fillRect(0, 0, w, h);
+  }
+}
+
+function drawGlassPanel(x, y, w, h, title, accent, glowAlpha = 0) {
+  ctx.save();
+  ctx.fillStyle = "rgba(0, 0, 0, 0.42)"; rrect(ctx, x + 2, y + 4, w, h, 10); ctx.fill();
+  const fg = ctx.createLinearGradient(x, y, x, y + h);
+  fg.addColorStop(0, "rgba(26, 38, 58, 0.72)"); fg.addColorStop(0.45, "rgba(14, 22, 36, 0.68)"); fg.addColorStop(1, "rgba(9, 14, 24, 0.78)");
+  ctx.fillStyle = fg; rrect(ctx, x, y, w, h, 10); ctx.fill();
+  if (glowAlpha > 0 && accent) {
+    ctx.fillStyle = accent; ctx.globalAlpha = glowAlpha;
+    rrect(ctx, x + 1, y + 1, w - 2, h - 2, 9); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  const spec = ctx.createLinearGradient(x, y, x, y + 24);
+  spec.addColorStop(0, "rgba(255, 255, 255, 0.14)"); spec.addColorStop(1, "rgba(255, 255, 255, 0)");
+  ctx.fillStyle = spec; rrect(ctx, x + 1, y + 1, w - 2, Math.min(24, h - 2), 9); ctx.fill();
+  ctx.strokeStyle = accent || "rgba(180, 225, 255, 0.18)"; ctx.lineWidth = glowAlpha > 0 ? 1.8 : 1;
+  rrect(ctx, x + 0.5, y + 0.5, w - 1, h - 1, 10); ctx.stroke();
+  if (title) {
+    ctx.fillStyle = "rgba(165, 215, 255, 0.85)"; ctx.font = "bold 10px monospace";
+    ctx.fillText(title, x + 10, y + 14);
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.08)";
+    ctx.beginPath(); ctx.moveTo(x + 8, y + 19); ctx.lineTo(x + w - 8, y + 19); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+const hit = (r, px, py) => px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
+
+function drawRubberBtn(id, x, y, w, h, label, opts = {}) {
+  const { active = false, color = "#00f0ff", onClick = null, font = "bold 10px monospace", disabled = false, ledProg = -1 } = opts;
+  const r = { id, x, y, w, h, onClick, disabled };
+  if (onClick && !disabled) uiBtns.push(r);
+  const isHov = !disabled && hit(r, mx, my);
+  const isDown = !disabled && pressedBtnId === id && down;
+  const dy = (isDown || active) ? 1.5 : 0;
+
+  ctx.save();
+  ctx.fillStyle = "rgba(0, 0, 0, 0.72)"; rrect(ctx, x, y + 2, w, h, 6); ctx.fill();
+  const rg = ctx.createLinearGradient(x, y + dy, x, y + dy + h);
+  if (active) { rg.addColorStop(0, "#1c2838"); rg.addColorStop(1, "#2a394e"); }
+  else if (isDown) { rg.addColorStop(0, "#15181e"); rg.addColorStop(1, "#222730"); }
+  else if (isHov) { rg.addColorStop(0, "#3b424d"); rg.addColorStop(0.2, "#2e343e"); rg.addColorStop(1, "#1c2027"); }
+  else { rg.addColorStop(0, "#303640"); rg.addColorStop(0.18, "#252a32"); rg.addColorStop(1, "#16191f"); }
+  ctx.fillStyle = rg; rrect(ctx, x, y + dy, w, h - 1, 6); ctx.fill();
+
+  if (active) {
+    ctx.fillStyle = color; ctx.globalAlpha = ledProg >= 0 ? 0.34 : 0.22;
+    rrect(ctx, x + 2, y + dy + 2, w - 4, h - 5, 4); ctx.fill();
+    ctx.globalAlpha = 1;
+    if (ledProg >= 0) {
+      const barW = Math.max(4, (w - 12) * Math.max(0, Math.min(1, 1 - ledProg)));
+      ctx.fillStyle = "rgba(0,0,0,0.45)"; ctx.fillRect(x + 6, y + dy + h - 7, w - 12, 3);
+      ctx.fillStyle = color; ctx.fillRect(x + 6, y + dy + h - 7, barW, 3);
+    } else {
+      ctx.fillRect(x + 6, y + dy + h - 4, w - 12, 2);
+    }
+  }
+  ctx.strokeStyle = active ? color : (isHov ? "rgba(255,255,255,0.28)" : "rgba(255,255,255,0.12)");
+  ctx.lineWidth = active ? 1.5 : 1; rrect(ctx, x + 0.5, y + dy + 0.5, w - 1, h - 2, 6); ctx.stroke();
+
+  ctx.fillStyle = disabled ? "#556070" : (active ? "#ffffff" : (isHov ? "#ffffff" : "#cfdbe8"));
+  ctx.font = font; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(label, x + w / 2, y + dy + (h - 1) / 2);
+  ctx.restore();
+}
+
+function drawSlider(id, x, y, w, h, label, val, min, max, dispText, onChange, opts = {}) {
+  const { color = "#00f0ff", locked = false } = opts;
+  const r = { id, x, y, w, h, min, max, onChange, locked, label: label || id };
+  if (!locked && onChange) uiSliders.push(r);
+  const norm = Math.max(0, Math.min(1, (val - min) / (max - min)));
+
+  ctx.save();
+  ctx.font = "10px monospace";
+  ctx.fillStyle = locked ? "#778899" : "#b8d0e8"; ctx.fillText(label, x, y + 9);
+  ctx.textAlign = "right";
+  ctx.fillStyle = locked ? "#ffaa00" : color;
+  ctx.fillText(locked ? `${dispText} [LOCK]` : dispText, x + w, y + 9);
+  ctx.textAlign = "left";
+
+  const ty = y + 14, th = 9;
+  ctx.fillStyle = "rgba(4, 8, 16, 0.85)"; rrect(ctx, x, ty, w, th, 4); ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.12)"; rrect(ctx, x + 0.5, ty + 0.5, w - 1, th - 1, 4); ctx.stroke();
+
+  const fillW = Math.max(4, norm * w);
+  ctx.fillStyle = locked ? "rgba(255, 170, 0, 0.35)" : color; ctx.globalAlpha = locked ? 0.5 : 0.65;
+  rrect(ctx, x + 1, ty + 1, fillW - 2, th - 2, 3); ctx.fill(); ctx.globalAlpha = 1;
+
+  const capW = 13, capH = 13, capX = x + norm * (w - capW), capY = ty - 2;
+  const cg = ctx.createLinearGradient(capX, capY, capX, capY + capH);
+  cg.addColorStop(0, locked ? "#3a3528" : "#444c58"); cg.addColorStop(1, locked ? "#201c14" : "#1c2028");
+  ctx.fillStyle = cg; rrect(ctx, capX, capY, capW, capH, 3); ctx.fill();
+  ctx.strokeStyle = locked ? "#ffaa00" : "#ffffff"; ctx.lineWidth = 1;
+  rrect(ctx, capX + 0.5, capY + 0.5, capW - 1, capH - 1, 3); ctx.stroke();
+  ctx.fillStyle = locked ? "#ffaa00" : color; ctx.fillRect(capX + capW / 2 - 1, capY + 3, 2, capH - 6);
+  ctx.restore();
+}
+
+function getMenuItems(menuName) {
+  if (menuName === "file") {
+    return [
+      { label: "New Project", shortcut: "", action: newProject },
+      { sep: true },
+      { label: "Save Project (.sp202.json)", shortcut: "Ctrl+S", action: saveProject },
+      { label: "Load Project (.sp202.json)", shortcut: "Ctrl+O", action: () => projIn.click() },
+      { sep: true },
+      { label: "Open Sample Folder...", shortcut: "", action: openSampleFolder },
+      { label: "Load Audio Files...", shortcut: "", action: () => fIn.click() },
+      { sep: true },
+      { label: `Export Pad ${activePad + 1} WAV`, shortcut: "", action: exportActivePadWav },
+      { label: "Export Song Timeline WAV", shortcut: "", action: exportTimelineWav }
+    ];
+  }
+  if (menuName === "edit") {
+    const undoLbl = undoStack.length ? `Undo (${undoStack[undoStack.length - 1].label})` : "Undo";
+    const redoLbl = redoStack.length ? `Redo (${redoStack[redoStack.length - 1].label})` : "Redo";
+    return [
+      { label: undoLbl, shortcut: "Ctrl+Z", disabled: !undoStack.length, action: doUndo },
+      { label: redoLbl, shortcut: "Ctrl+Y", disabled: !redoStack.length, action: doRedo },
+      { sep: true },
+      { label: "Cut Selection", shortcut: "Ctrl+X", disabled: !seqSel, action: cutSeqSelection },
+      { label: "Copy Selection", shortcut: "Ctrl+C", disabled: !seqSel, action: copySeqSelection },
+      { label: "Paste", shortcut: "Ctrl+V", disabled: !seqClipboard, action: () => pasteSeqClipboard() },
+      { label: "Duplicate Selection", shortcut: "Ctrl+D", disabled: !seqSel, action: duplicateSeqSelection },
+      { label: "Delete Selection", shortcut: "Del", disabled: !seqSel, action: deleteSeqSelection },
+      { sep: true },
+      { label: "Select All Timeline", shortcut: "Ctrl+A", action: selectAllTimeline },
+      { label: seqSel ? "Clear Selected Waves" : "Clear Entire Song", shortcut: "", action: clearSelectionOrSong }
+    ];
+  }
+  return [];
+}
+
+function drawDropdownMenu() {
+  menuItemRects = [];
+  menuPanelRect = null;
+  if (!openMenu || !menuBtnRects[openMenu]) return;
+
+  const anchor = menuBtnRects[openMenu];
+  const items = getMenuItems(openMenu);
+  const mw = 262, padY = 6, itemH = 24, sepH = 9;
+  let mh = padY * 2;
+  for (const it of items) mh += it.sep ? sepH : itemH;
+
+  const x = anchor.x, y = anchor.y + anchor.h + 4;
+  menuPanelRect = { x, y, w: mw, h: mh };
+
+  ctx.save();
+  ctx.fillStyle = "rgba(0, 0, 0, 0.65)"; rrect(ctx, x + 3, y + 5, mw, mh, 8); ctx.fill();
+  const bg = ctx.createLinearGradient(x, y, x, y + mh);
+  bg.addColorStop(0, "rgba(20, 32, 52, 0.96)"); bg.addColorStop(1, "rgba(8, 14, 26, 0.98)");
+  ctx.fillStyle = bg; rrect(ctx, x, y, mw, mh, 8); ctx.fill();
+  ctx.strokeStyle = "#00f0ff"; ctx.lineWidth = 1.2; rrect(ctx, x + 0.5, y + 0.5, mw - 1, mh - 1, 8); ctx.stroke();
+
+  let cy = y + padY;
+  for (const it of items) {
+    if (it.sep) {
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.12)";
+      ctx.beginPath(); ctx.moveTo(x + 10, cy + 4.5); ctx.lineTo(x + mw - 10, cy + 4.5); ctx.stroke();
+      cy += sepH;
+      continue;
+    }
+    const r = { x: x + 4, y: cy, w: mw - 8, h: itemH, action: it.action, disabled: !!it.disabled };
+    menuItemRects.push(r);
+    const hov = !it.disabled && hit(r, mx, my);
+    if (hov) {
+      ctx.fillStyle = "rgba(0, 240, 255, 0.22)";
+      rrect(ctx, r.x, r.y + 1, r.w, r.h - 2, 5); ctx.fill();
+    }
+    ctx.font = "11px monospace";
+    ctx.fillStyle = it.disabled ? "#4e6074" : (hov ? "#ffffff" : "#d6e8f8");
+    ctx.fillText(it.label.slice(0, 28), x + 12, cy + 15);
+    if (it.shortcut) {
+      ctx.textAlign = "right";
+      ctx.fillStyle = it.disabled ? "#3c4c5c" : (hov ? "#00ffcc" : "#7799bb");
+      ctx.fillText(it.shortcut, x + mw - 12, cy + 15);
+      ctx.textAlign = "left";
+    }
+    cy += itemH;
+  }
+  ctx.restore();
+}
+
+// ==========================================
+// 10. ZOOM HELPERS & CACHE RENDERERS
+// ==========================================
+function clampView() {
+  viewZoom = Math.max(1, Math.min(256, viewZoom));
+  viewOffset = Math.max(0, Math.min(Math.max(0, 1 - 1 / viewZoom), viewOffset));
+}
+function setZoom(newZoom, anchorNorm) {
+  const oldSpan = 1 / viewZoom, anchor = anchorNorm !== undefined ? anchorNorm : (viewOffset + oldSpan * 0.5);
+  const rel = (anchor - viewOffset) / oldSpan;
+  viewZoom = Math.max(1, Math.min(256, newZoom));
+  viewOffset = anchor - rel * (1 / viewZoom);
+  clampView(); waveCacheDirty = true; requestDraw();
+}
+
+function clampSeqView() {
+  seqZoom = Math.max(1, Math.min(16, seqZoom));
+  seqScroll = Math.max(0, Math.min(Math.max(0, 1 - 1 / seqZoom), seqScroll));
+}
+function setSeqZoom(newZoom, anchorNorm) {
+  const oldSpan = 1 / seqZoom, anchor = anchorNorm !== undefined ? anchorNorm : (seqScroll + oldSpan * 0.5);
+  const rel = (anchor - seqScroll) / oldSpan;
+  seqZoom = Math.max(1, Math.min(16, newZoom));
+  seqScroll = anchor - rel * (1 / seqZoom);
+  clampSeqView(); seqCacheDirty = true; requestDraw();
+}
+
+function renderOverviewCache(w, h) {
+  ovWfCv.width = w; ovWfCv.height = h;
+  const g = ovWfCtx, mid = h / 2, pad = pads[activePad];
+  g.fillStyle = "#040812"; g.fillRect(0, 0, w, h);
+  g.strokeStyle = "rgba(0, 240, 255, 0.16)"; g.beginPath(); g.moveTo(0, mid + 0.5); g.lineTo(w, mid + 0.5); g.stroke();
+  if (!pad || !pad.rawBuf) { ovCacheDirty = false; return; }
+  const data = pad.rawBuf.getChannelData(0), len = data.length, spp = len / w, stride = Math.max(1, Math.floor(spp / 28)), amp = mid - 3;
+  g.fillStyle = "rgba(0, 225, 255, 0.55)";
+  for (let x = 0; x < w; x++) {
+    const a = Math.floor(x * spp), b = Math.min(len, Math.max(a + 1, Math.floor((x + 1) * spp)));
+    let mn = 0, mx = 0;
+    for (let i = a; i < b; i += stride) { const v = data[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
+    g.fillRect(x, mid - mx * amp, 1, Math.max(1, (mx - mn) * amp));
+  }
+  const stX = pad.st * w, enX = pad.en * w;
+  g.fillStyle = "rgba(0, 0, 0, 0.62)"; g.fillRect(0, 0, stX, h); g.fillRect(enX, 0, w - enX, h);
+  g.strokeStyle = pad.lockSE ? "#ffaa00" : "#00f0ff"; g.lineWidth = 1.5; g.beginPath(); g.moveTo(stX, 0); g.lineTo(stX, h); g.stroke();
+  g.strokeStyle = pad.lockSE ? "#ffaa00" : "#ff2a85"; g.beginPath(); g.moveTo(enX, 0); g.lineTo(enX, h); g.stroke();
+  ovCacheDirty = false;
+}
+
+function renderWaveCache(w, h) {
+  wfCv.width = w; wfCv.height = h;
+  const g = wfCtx, mid = h / 2, pad = pads[activePad];
+  const bg = g.createLinearGradient(0, 0, 0, h);
+  bg.addColorStop(0, "#040812"); bg.addColorStop(0.5, "#071222"); bg.addColorStop(1, "#03060d");
+  g.fillStyle = bg; g.fillRect(0, 0, w, h);
+
+  g.strokeStyle = "rgba(0, 240, 255, 0.08)"; g.lineWidth = 1; g.beginPath();
+  for (let x = 0; x < w; x += 48) { g.moveTo(x + 0.5, 0); g.lineTo(x + 0.5, h); }
+  for (let y = 0; y < h; y += 26) { g.moveTo(0, y + 0.5); g.lineTo(w, y + 0.5); }
+  g.stroke();
+  g.strokeStyle = "rgba(0, 240, 255, 0.25)"; g.beginPath(); g.moveTo(0, mid + 0.5); g.lineTo(w, mid + 0.5); g.stroke();
+
+  if (!pad || !pad.rawBuf) {
+    g.fillStyle = "#00f0ff"; g.font = "bold 13px monospace"; g.textAlign = "center";
+    g.fillText(`PAD ${activePad + 1} EMPTY — DRAG SAMPLE FROM TREE OR DESKTOP HERE`, w / 2, mid);
+    g.textAlign = "left"; waveCacheDirty = false; return;
+  }
+
+  const rawBuf = pad.rawBuf, data = rawBuf.getChannelData(0), len = data.length;
+  const viewSpan = 1 / viewZoom, viewStart = viewOffset, viewEnd = Math.min(1, viewStart + viewSpan);
+  const sStart = Math.floor(viewStart * len), sEnd = Math.min(len, Math.max(sStart + 2, Math.ceil(viewEnd * len)));
+  const spp = (sEnd - sStart) / w, c = getDspCoeffs(pad, rawBuf.sampleRate), srRatio = pad.sr / rawBuf.sampleRate;
+  const ampScale = mid - 14;
+
+  const shapeVis = v => {
+    if (pad.bypass) return v;
+    let s = (Math.tanh((v + 0.015) * pad.drv) - Math.tanh(0.015 * pad.drv)) / c.normDrive;
+    s = Math.max(-1, Math.min(1, s));
+    const comp = Math.sign(s) * Math.log(1 + c.mu * Math.abs(s)) / c.logMu;
+    const q = Math.round(comp * c.levels) / c.levels;
+    const exp = Math.sign(q) * (Math.pow(1 + c.mu, Math.abs(q)) - 1) / c.mu;
+    return Math.max(-1, Math.min(1, Math.tanh(exp * c.autoMakeup * 0.95) / 0.74));
+  };
+
+  if (spp <= 2.5) {
+    g.strokeStyle = pad.bypass ? "#ffaa00" : "#55ffff"; g.lineWidth = 1.6; g.beginPath();
+    let lastHoldIdx = -1, holdVal = 0;
+    for (let x = 0; x < w; x++) {
+      const idx = Math.min(len - 1, Math.floor(sStart + x * spp));
+      const v = pad.bypass ? data[idx] : (() => { const sIdx = Math.floor(idx * srRatio); if (sIdx !== lastHoldIdx) { lastHoldIdx = sIdx; holdVal = shapeVis(data[idx]); } return holdVal; })();
+      const y = mid - v * ampScale; x === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
+    }
+    g.stroke();
+  } else {
+    const mins = new Float32Array(w), maxs = new Float32Array(w), rmsArr = new Float32Array(w);
+    const stride = Math.max(1, Math.floor(spp / 80));
+    for (let x = 0; x < w; x++) {
+      const a = sStart + Math.floor(x * spp), b = Math.min(len, Math.max(a + 1, sStart + Math.floor((x + 1) * spp)));
+      let mn = 0, mx = 0, sumSq = 0, cnt = 0;
+      for (let i = a; i < b; i += stride) { const v = data[i]; if (v < mn) mn = v; if (v > mx) mx = v; sumSq += v * v; cnt++; }
+      mins[x] = shapeVis(mn); maxs[x] = shapeVis(mx); rmsArr[x] = shapeVis(Math.sqrt(sumSq / Math.max(1, cnt)));
+    }
+    const wfGrad = g.createLinearGradient(0, 8, 0, h - 8);
+    wfGrad.addColorStop(0, "rgba(0, 255, 210, 0.55)"); wfGrad.addColorStop(0.5, "rgba(0, 140, 255, 0.22)"); wfGrad.addColorStop(1, "rgba(0, 255, 210, 0.55)");
+    g.fillStyle = wfGrad; g.beginPath(); g.moveTo(0, mid);
+    for (let x = 0; x < w; x++) g.lineTo(x, mid - maxs[x] * ampScale);
+    for (let x = w - 1; x >= 0; x--) g.lineTo(x, mid - mins[x] * ampScale);
+    g.closePath(); g.fill();
+
+    g.fillStyle = pad.bypass ? "rgba(255, 170, 0, 0.55)" : "rgba(0, 240, 255, 0.62)";
+    g.beginPath(); g.moveTo(0, mid);
+    for (let x = 0; x < w; x++) g.lineTo(x, mid - rmsArr[x] * ampScale);
+    for (let x = w - 1; x >= 0; x--) g.lineTo(x, mid + rmsArr[x] * ampScale);
+    g.closePath(); g.fill();
+  }
+
+  const toX = norm => ((norm - viewStart) / viewSpan) * w;
+  const stX = toX(pad.st), enX = toX(pad.en);
+  g.fillStyle = "rgba(0, 0, 0, 0.66)";
+  if (stX > 0) g.fillRect(0, 0, Math.min(w, stX), h);
+  if (enX < w) g.fillRect(Math.max(0, enX), 0, w - Math.max(0, enX), h);
+
+  const stCol = pad.lockSE ? "#ffaa00" : "#00f0ff", enCol = pad.lockSE ? "#ffaa00" : "#ff2a85";
+  if (stX >= -18 && stX <= w + 18) {
+    g.strokeStyle = stCol; g.lineWidth = 2; g.beginPath(); g.moveTo(stX, 0); g.lineTo(stX, h); g.stroke();
+    g.fillStyle = stCol; g.fillRect(stX, 0, pad.lockSE ? 26 : 18, 16);
+    g.fillStyle = "#000"; g.font = "bold 10px monospace"; g.fillText(pad.lockSE ? "🔒S" : "S", stX + 4, 12);
+  }
+  if (enX >= -18 && enX <= w + 18) {
+    g.strokeStyle = enCol; g.lineWidth = 2; g.beginPath(); g.moveTo(enX, 0); g.lineTo(enX, h); g.stroke();
+    const tw = pad.lockSE ? 26 : 18;
+    g.fillStyle = enCol; g.fillRect(enX - tw, 0, tw, 16);
+    g.fillStyle = pad.lockSE ? "#000" : "#fff"; g.font = "bold 10px monospace"; g.fillText(pad.lockSE ? "🔒E" : "E", enX - tw + 4, 12);
+  }
+
+  const fxTags = [];
+  if (pad.fMode > 0) fxTags.push(FMODES[pad.fMode]);
+  if (pad.rmOn) fxTags.push("RING");
+  if (pad.dlOn && pad.dlAmt > 0) fxTags.push("DLY");
+  const hud = `PAD ${activePad + 1}: ${pad.name.slice(0, 18)} // ${pad.bypass ? "RAW" : `${G[pad.grd].name} ${pad.sr}Hz ${c.bits}B`}${fxTags.length ? " // " + fxTags.join("+") : ""}`;
+  g.font = "10px monospace";
+  const hw = g.measureText(hud).width + 16;
+  g.fillStyle = "rgba(4, 10, 20, 0.82)"; g.fillRect(28, 6, hw, 18);
+  g.strokeStyle = "rgba(0,240,255,0.35)"; g.strokeRect(28.5, 6.5, hw - 1, 17);
+  g.fillStyle = pad.bypass ? "#ffaa00" : "#00ffcc"; g.fillText(hud, 36, 18);
+
+  const winStr = `VIEW ${(viewStart * rawBuf.duration).toFixed(2)}s-${(viewEnd * rawBuf.duration).toFixed(2)}s (${viewZoom.toFixed(1)}x) | OUT ${getPadOutDur(pad).toFixed(2)}s`;
+  const ww = g.measureText(winStr).width + 14;
+  g.fillStyle = "rgba(4, 10, 20, 0.82)"; g.fillRect(8, h - 20, ww, 16);
+  g.fillStyle = "#88e8ff"; g.fillText(winStr, 14, h - 8);
+  waveCacheDirty = false;
+}
+
+const SEQ_HDR_W = 112, SEQ_VU_W = 18, SEQ_GRID_X = SEQ_HDR_W + SEQ_VU_W;
+const SEQ_LOOP_H = 14, SEQ_SCRUB_H = 18, SEQ_TOP_H = SEQ_LOOP_H + SEQ_SCRUB_H;
+
+function renderSeqCache(w, h) {
+  seqCacheCv.width = w; seqCacheCv.height = h;
+  const g = seqCacheCtx, gridW = w - SEQ_GRID_X;
+  const visBars = seqBars / seqZoom, startBarF = seqScroll * seqBars, colW = gridW / visBars;
+  const rowH = (h - SEQ_TOP_H) / Math.max(1, seqTracks.length), barDur = 240 / seqBpm;
+  const barToX = b => SEQ_GRID_X + (b - startBarF) * colW;
+  const snapTicks = SEQ_SNAPS[seqSnapIdx].ticks;
+  const totalTicks = seqBars * TICKS_PER_BAR;
+
+  g.fillStyle = "#040812"; g.fillRect(0, 0, w, h);
+  g.fillStyle = "#0b1424"; g.fillRect(0, 0, SEQ_GRID_X, SEQ_TOP_H);
+  g.fillStyle = "#00ff88"; g.font = "bold 9px monospace"; g.fillText("LOOP", 8, 10);
+  g.fillStyle = "#88ccff"; g.font = "bold 10px monospace"; g.fillText("TRACK / SCRUB", 8, SEQ_LOOP_H + 13);
+  g.fillStyle = "#00ff88"; g.fillText("VU", SEQ_HDR_W + 3, SEQ_LOOP_H + 13);
+  g.fillStyle = "#02050a"; g.fillRect(SEQ_HDR_W, SEQ_TOP_H, SEQ_VU_W, h - SEQ_TOP_H);
+
+  for (let t = 0; t < seqTracks.length; t++) {
+    const trk = seqTracks[t], y = SEQ_TOP_H + t * rowH, col = TRK_COLS[t % TRK_COLS.length];
+    g.fillStyle = t % 2 === 0 ? "#08101e" : "#060c16";
+    g.fillRect(0, y, SEQ_HDR_W, rowH);
+    g.strokeStyle = "rgba(0,240,255,0.12)"; g.beginPath(); g.moveTo(0, y + 0.5); g.lineTo(SEQ_HDR_W, y + 0.5); g.stroke();
+    g.fillStyle = trk.mute ? "#444" : col; g.fillRect(2, y + 3, 4, rowH - 6);
+    g.fillStyle = trk.mute ? "#666" : "#ddeeff"; g.font = "10px monospace";
+    g.fillText(trk.mode === "step" ? `T${t + 1} [STEP]` : `T${t + 1}:P${trk.padIdx + 1} ${pads[trk.padIdx].name.slice(0, 6)}`, 10, y + rowH / 2 + 3);
+  }
+
+  g.save();
+  g.beginPath(); g.rect(SEQ_GRID_X, 0, gridW, h); g.clip();
+  g.fillStyle = "#07101e"; g.fillRect(SEQ_GRID_X, 0, gridW, SEQ_LOOP_H);
+  g.fillStyle = "#0e1a2e"; g.fillRect(SEQ_GRID_X, SEQ_LOOP_H, gridW, SEQ_SCRUB_H);
+
+  for (let t = 0; t < seqTracks.length; t++) {
+    const y = SEQ_TOP_H + t * rowH;
+    g.fillStyle = t % 2 === 0 ? "#08101e" : "#060c16"; g.fillRect(SEQ_GRID_X, y, gridW, rowH);
+    g.strokeStyle = "rgba(0,240,255,0.12)"; g.beginPath(); g.moveTo(SEQ_GRID_X, y + 0.5); g.lineTo(w, y + 0.5); g.stroke();
+  }
+
+  const firstVisBar = Math.max(0, Math.floor(startBarF)), lastVisBar = Math.min(seqBars, Math.ceil(startBarF + visBars));
+  const labelStep = colW < 18 ? 4 : (colW < 28 ? 2 : 1);
+  const snapPx = (snapTicks / TICKS_PER_BAR) * colW;
+
+  for (let b = firstVisBar; b <= lastVisBar; b++) {
+    const x = barToX(b), isPhrase = b % 4 === 0;
+    g.strokeStyle = isPhrase ? "rgba(0,240,255,0.36)" : "rgba(0,240,255,0.16)";
+    g.beginPath(); g.moveTo(x + 0.5, SEQ_LOOP_H); g.lineTo(x + 0.5, h); g.stroke();
+    if (b < seqBars && b % labelStep === 0) {
+      g.fillStyle = isPhrase ? "#00ffcc" : "#6688aa"; g.font = "10px monospace"; g.fillText(String(b + 1), x + 3, SEQ_LOOP_H + 13);
+    }
+    if (b < seqBars && snapTicks < TICKS_PER_BAR && snapPx >= 6) {
+      for (let tk = snapTicks; tk < TICKS_PER_BAR; tk += snapTicks) {
+        const sx = x + (tk / TICKS_PER_BAR) * colW;
+        const isHalfBar = tk === 4, isBeat = tk % 2 === 0;
+        g.strokeStyle = isHalfBar ? "rgba(0,240,255,0.11)" : (isBeat ? "rgba(0,240,255,0.06)" : "rgba(0,240,255,0.035)");
+        g.beginPath(); g.moveTo(sx + 0.5, SEQ_TOP_H); g.lineTo(sx + 0.5, h); g.stroke();
+        g.strokeStyle = isBeat ? "rgba(0,240,255,0.28)" : "rgba(0,240,255,0.15)";
+        g.beginPath(); g.moveTo(sx + 0.5, SEQ_LOOP_H + SEQ_SCRUB_H - (isBeat ? 5 : 3)); g.lineTo(sx + 0.5, SEQ_LOOP_H + SEQ_SCRUB_H); g.stroke();
+      }
+    }
+  }
+
+  const lx0 = barToX(seqLoopStart), lx1 = barToX(seqLoopEnd);
+  if (seqLoopOn) {
+    g.fillStyle = "rgba(0, 0, 0, 0.36)";
+    if (lx0 > SEQ_GRID_X) g.fillRect(SEQ_GRID_X, SEQ_TOP_H, Math.min(gridW, lx0 - SEQ_GRID_X), h - SEQ_TOP_H);
+    if (lx1 < w) g.fillRect(Math.max(SEQ_GRID_X, lx1), SEQ_TOP_H, w - Math.max(SEQ_GRID_X, lx1), h - SEQ_TOP_H);
+    g.fillStyle = "rgba(0, 255, 136, 0.35)"; g.fillRect(lx0, 1, Math.max(4, lx1 - lx0), SEQ_LOOP_H - 2);
+    g.strokeStyle = "#00ff88"; g.lineWidth = 1.2; g.strokeRect(lx0 + 0.5, 1.5, Math.max(3, lx1 - lx0 - 1), SEQ_LOOP_H - 3);
+    g.fillStyle = "#00ff88"; g.fillRect(lx0, 1, 7, SEQ_LOOP_H - 2); g.fillRect(lx1 - 7, 1, 7, SEQ_LOOP_H - 2);
+    g.fillStyle = "#002211"; g.font = "bold 9px monospace";
+    const fBar = v => Number.isInteger(v) ? String(v) : v.toFixed(2);
+    if (lx1 - lx0 > 46) g.fillText(`LOOP ${fBar(seqLoopStart + 1)}-${fBar(seqLoopEnd)}`, lx0 + 10, 10);
+  } else {
+    g.fillStyle = "rgba(120, 150, 180, 0.16)"; g.fillRect(lx0, 2, Math.max(4, lx1 - lx0), SEQ_LOOP_H - 4);
+  }
+
+  for (let t = 0; t < seqTracks.length; t++) {
+    const trk = seqTracks[t], y = SEQ_TOP_H + t * rowH, col = TRK_COLS[t % TRK_COLS.length];
+    if (trk.mode === "loop") {
+      const pad = pads[trk.padIdx], padDur = getPadOutDur(pad), naturalBars = padDur > 0 ? padDur / barDur : 1;
+      for (let k = 0; k < totalTicks; k++) {
+        if (!trk.cells[k]) continue;
+        let maxTicks = totalTicks - k;
+        for (let nk = k + 1; nk < totalTicks; nk++) if (trk.cells[nk]) { maxTicks = nk - k; break; }
+        const startB = k / TICKS_PER_BAR;
+        const drawnBars = Math.min(naturalBars, maxTicks / TICKS_PER_BAR);
+        if (startB + drawnBars < startBarF || startB > startBarF + visBars) continue;
+        const clipX = barToX(startB), fullPx = Math.max(6, naturalBars * colW), clipW = Math.max(5, drawnBars * colW - 1.5);
+        const clipY = y + 3, clipH = rowH - 6;
+        const inSel = seqSel && t >= seqSel.t0 && t <= seqSel.t1 && k >= seqSel.k0 && k < seqSel.k1;
+
+        g.fillStyle = trk.mute ? "rgba(70,70,70,0.35)" : (inSel ? "rgba(0, 95, 135, 0.92)" : "rgba(0, 40, 68, 0.85)");
+        g.fillRect(clipX + 1, clipY, clipW, clipH);
+        g.strokeStyle = inSel ? "#ffffff" : (trk.mute ? "#555" : col);
+        g.lineWidth = inSel ? 1.8 : 1;
+        g.strokeRect(clipX + 1.5, clipY + 0.5, clipW - 1, clipH - 1);
+
+        if (pad.miniPeaks) {
+          const peaks = pad.miniPeaks, midY = clipY + clipH / 2, ampH = (clipH / 2) - 2;
+          g.fillStyle = trk.mute ? "rgba(140,140,140,0.5)" : (inSel ? "#ffffff" : col);
+          const pxStart = Math.max(0, Math.floor(SEQ_GRID_X - (clipX + 2))), pxEnd = Math.min(Math.floor(clipW - 2), Math.ceil(w - (clipX + 2)));
+          for (let px = pxStart; px < pxEnd; px++) {
+            const norm = px / fullPx; if (norm >= 1) break;
+            const ph = Math.max(1, peaks[Math.min(peaks.length - 1, Math.floor(norm * peaks.length))] * ampH);
+            g.fillRect(clipX + 2 + px, midY - ph, 1, ph * 2);
+          }
+        }
+        if (clipW > 22) {
+          g.fillStyle = "rgba(0,0,0,0.68)"; g.fillRect(clipX + 2, clipY + 1, Math.min(clipW - 3, 52), 11);
+          g.fillStyle = "#fff"; g.font = "9px monospace"; g.fillText(`P${trk.padIdx + 1} ${naturalBars.toFixed(1)}b`, clipX + 4, clipY + 9);
+        }
+      }
+    } else {
+      for (let k = 0; k < totalTicks; k++) {
+        const pNum = trk.cells[k]; if (!pNum) continue;
+        let spanTicks = Math.min(TICKS_PER_BAR, totalTicks - k);
+        for (let nk = k + 1; nk < k + spanTicks; nk++) if (trk.cells[nk]) { spanTicks = nk - k; break; }
+        const startB = k / TICKS_PER_BAR, drawnBars = spanTicks / TICKS_PER_BAR;
+        if (startB + drawnBars < startBarF || startB > startBarF + visBars) continue;
+
+        const pCol = PAT_COLS[(pNum - 1) % PAT_COLS.length];
+        const x = barToX(startB), cy = y + 3, ch = rowH - 6, cw = Math.max(4, drawnBars * colW - 1.5);
+        const fullBarW = Math.max(4, colW - 2);
+        const inSel = seqSel && t >= seqSel.t0 && t <= seqSel.t1 && k >= seqSel.k0 && k < seqSel.k1;
+
+        g.fillStyle = trk.mute ? "rgba(70,70,70,0.4)" : (inSel ? "rgba(42, 65, 98, 0.95)" : "rgba(18, 28, 48, 0.92)");
+        g.fillRect(x + 1, cy, cw, ch);
+        g.strokeStyle = inSel ? "#ffffff" : (trk.mute ? "#555" : pCol);
+        g.lineWidth = inSel ? 1.8 : 1.2;
+        g.strokeRect(x + 1.5, cy + 0.5, cw - 1, ch - 1);
+
+        if (cw >= 10) {
+          const pat = stepPats[pNum - 1], sw = (fullBarW - 4) / 16, sh = (ch - 10) / 8;
+          const activeSteps = spanTicks * STEPS_PER_TICK;
+          g.fillStyle = trk.mute ? "#888" : (inSel ? "#ffffff" : pCol);
+          for (let ln = 0; ln < 8; ln++) {
+            for (let st = 0; st < activeSteps; st++) {
+              if (pat[ln][st]) g.fillRect(x + 3 + st * sw, cy + 9 + ln * sh, Math.max(1, sw - 0.4), Math.max(1, sh - 0.3));
+            }
+          }
+          g.fillStyle = trk.mute ? "#999" : pCol; g.font = "bold 9px monospace"; g.fillText(`P${pNum}`, x + 3, cy + 8);
+        }
+      }
+    }
+  }
+  g.restore();
+  seqCacheDirty = false;
+}
+
+// ==========================================
+// 11. FULLSCREEN CANVAS UI RENDERER
+// ==========================================
+function draw() {
+  const W = cv.width, H = cv.height;
+  uiBtns = []; uiSliders = []; dropZones = []; menuBtnRects = {};
+  waveRect = ovRect = hScrRect = hThumbRect = null;
+  seqGridRect = seqLoopRect = seqScrubRect = seqHScrRect = seqHThumbRect = stepGridRect = null;
+
+  ctx.drawImage(bgCv, 0, 0);
+
+  // --- LEFT SIDEBAR: FROSTED GLASS SAMPLE TREE ---
+  const sbW = 232, padM = 8;
+  drawGlassPanel(padM, padM, sbW, H - padM * 2, "SAMPLE TREE (CLICK=AUDITION | DRAG=LOAD)");
+  drawRubberBtn("tDir", padM + 8, padM + 26, 104, 24, "+ FOLDER", { onClick: openSampleFolder });
+  drawRubberBtn("tFil", padM + 118, padM + 26, 106, 24, "+ FILES", { onClick: () => fIn.click() });
+
+  const tlX = padM + 8, tlY = padM + 56, tlW = sbW - 16, tlH = H - padM * 2 - 64;
+  treeListRect = { x: tlX, y: tlY, w: tlW - 12, h: tlH };
+  ctx.save();
+  ctx.fillStyle = "rgba(3, 6, 14, 0.55)"; rrect(ctx, tlX, tlY, tlW, tlH, 6); ctx.fill();
+  ctx.beginPath(); rrect(ctx, tlX, tlY, tlW - 12, tlH, 6); ctx.clip();
+
+  const rowH = 21, maxScroll = Math.max(0, treeFlat.length * rowH - tlH);
+  treeScroll = Math.max(0, Math.min(maxScroll, treeScroll));
+  if (!treeFlat.length) {
+    ctx.fillStyle = "rgba(150, 195, 230, 0.55)"; ctx.font = "10px monospace";
+    ctx.fillText("Open a folder or load files.", tlX + 10, tlY + 24);
+    ctx.fillText("Click to audition.", tlX + 10, tlY + 40);
+    ctx.fillText("Drag onto any Pad or Track.", tlX + 10, tlY + 56);
+  } else {
+    const startIdx = Math.floor(treeScroll / rowH), endIdx = Math.min(treeFlat.length, startIdx + Math.ceil(tlH / rowH) + 2);
+    for (let i = startIdx; i < endIdx; i++) {
+      const item = treeFlat[i], iy = tlY + i * rowH - treeScroll;
+      const isHov = hit({ x: tlX, y: iy, w: tlW - 12, h: rowH }, mx, my) && hit(treeListRect, mx, my);
+      const isAud = item.type === "file" && treeAudName === item.name;
+      if (isAud || isHov) {
+        ctx.fillStyle = isAud ? "rgba(0, 240, 255, 0.22)" : "rgba(255, 255, 255, 0.08)";
+        ctx.fillRect(tlX + 2, iy + 1, tlW - 16, rowH - 2);
+      }
+      ctx.fillStyle = item.type === "dir" ? "#ffbb44" : (isAud ? "#00ffcc" : "#cfe0f5");
+      ctx.font = "10px monospace";
+      const icon = item.type === "dir" ? (item.open ? "📂 " : "📁 ") : "🎵 ";
+      const indent = item.depth * 11;
+      ctx.fillText((icon + item.name).slice(0, 25 - Math.floor(indent / 6)), tlX + 6 + indent, iy + 14);
+    }
+  }
+  ctx.restore();
+
+  const tsbX = tlX + tlW - 10;
+  ctx.fillStyle = "rgba(0,0,0,0.5)"; rrect(ctx, tsbX, tlY + 2, 8, tlH - 4, 4); ctx.fill();
+  if (maxScroll > 0) {
+    const th = Math.max(24, (tlH / (treeFlat.length * rowH)) * (tlH - 4));
+    const ty = tlY + 2 + (treeScroll / maxScroll) * (tlH - 4 - th);
+    treeThumbRect = { x: tsbX - 2, y: ty, w: 12, h: th, trackY: tlY + 2, trackH: tlH - 4, maxScroll };
+    ctx.fillStyle = "rgba(0, 240, 255, 0.55)"; rrect(ctx, tsbX + 1, ty, 6, th, 3); ctx.fill();
+  } else treeThumbRect = null;
+
+  // --- MAIN RIGHT AREA: TOP MENU + TABS ---
+  const mX = padM + sbW + 8, mW = W - mX - padM, topH = 38;
+  drawGlassPanel(mX, padM, mW, topH);
+
+  let tx = mX + 8;
+  menuBtnRects.file = { x: tx, y: padM + 6, w: 50, h: 26 };
+  drawRubberBtn("menu_file", tx, padM + 6, 50, 26, "FILE", {
+    active: openMenu === "file", color: "#00ffcc",
+    onClick: () => { openMenu = openMenu === "file" ? null : "file"; }
+  });
+  tx += 54;
+
+  menuBtnRects.edit = { x: tx, y: padM + 6, w: 50, h: 26 };
+  drawRubberBtn("menu_edit", tx, padM + 6, 50, 26, "EDIT", {
+    active: openMenu === "edit", color: "#00ffcc",
+    onClick: () => { openMenu = openMenu === "edit" ? null : "edit"; }
+  });
+  tx += 58;
+
+  const tabDefs = [
+    ["pads", "[1] 8-PAD MATRIX"],
+    ["edit", `[2] WAVE (P${activePad + 1})`],
+    ["seq",  "[3] SONG TIMELINE"],
+    ["step", `[4] STEP (P${activeStepPat + 1})`]
+  ];
+  for (const [key, lbl] of tabDefs) {
+    const bw = 132;
+    drawRubberBtn("tab_" + key, tx, padM + 6, bw, 26, lbl, { active: activeTab === key, color: "#00f0ff", onClick: () => switchTab(key) });
+    tx += bw + 5;
+  }
+  drawRubberBtn("panic", mX + mW - 90, padM + 6, 82, 26, "■ STOP ALL", { color: "#ff3355", active: edPlaying || seqRunning || stepRunning, onClick: stopAllAudio });
+
+  ctx.fillStyle = "rgba(180, 225, 255, 0.78)"; ctx.font = "10px monospace";
+  const stAvail = (mX + mW - 98) - (tx + 4);
+  if (stAvail > 60) ctx.fillText(statusMsg.slice(0, Math.floor(stAvail / 6.2)), tx + 4, padM + 22);
+
+  const bodyY = padM + topH + 8, bodyH = H - bodyY - padM;
+  if (activeTab === "pads") drawPadsTab(mX, bodyY, mW, bodyH);
+  else if (activeTab === "edit") drawEditorTab(mX, bodyY, mW, bodyH);
+  else if (activeTab === "seq") drawTimelineTab(mX, bodyY, mW, bodyH);
+  else if (activeTab === "step") drawStepTab(mX, bodyY, mW, bodyH);
+
+  if (activeDrag && activeDrag.type === "treeDrag") {
+    const lbl = "🎵 " + activeDrag.name.slice(0, 26);
+    ctx.save(); ctx.font = "bold 11px monospace";
+    const pw = ctx.measureText(lbl).width + 24;
+    ctx.fillStyle = "rgba(10, 24, 42, 0.88)"; rrect(ctx, mx + 12, my - 14, pw, 28, 14); ctx.fill();
+    ctx.strokeStyle = "#00f0ff"; ctx.lineWidth = 1.5; rrect(ctx, mx + 12.5, my - 13.5, pw - 1, 27, 14); ctx.stroke();
+    ctx.fillStyle = "#ffffff"; ctx.fillText(lbl, mx + 24, my + 4); ctx.restore();
+  }
+
+  drawDropdownMenu();
+}
+
+// --- TAB 1: 8-PAD MATRIX ---
+function drawPadsTab(x, y, w, h) {
+  drawGlassPanel(x, y, w, h, "SP-202 8-PAD MATRIX // LIVE LED DURATION SYNC // KEYS 1-8 TRIGGER");
+  drawRubberBtn("pmSong", x + w - 188, y + 4, 86, 18, seqRunning ? "■ SONG" : "▶ SONG", {
+    active: seqRunning, color: "#00ff88", onClick: () => seqRunning ? stopSeq() : startSeq()
+  });
+  drawRubberBtn("pmPat", x + w - 96, y + 4, 86, 18, stepRunning ? `■ PAT P${activeStepPat + 1}` : `▶ PAT P${activeStepPat + 1}`, {
+    active: stepRunning, color: "#ffaa00", onClick: () => stepRunning ? stopStepPat() : startStepPat()
+  });
+
+  const gx = x + 14, gy = y + 32, gw = w - 28, gh = h - 46, gap = 12, pw = (gw - gap * 3) / 4, ph = (gh - gap) / 2;
+  for (let i = 0; i < 8; i++) {
+    const col = i % 4, row = Math.floor(i / 4), px = gx + col * (pw + gap), py = gy + row * (ph + gap);
+    const pad = pads[i], pCol = TRK_COLS[i], isAct = activePad === i, led = getPadLedState(pad);
+
+    dropZones.push({ x: px, y: py, w: pw, h: ph, onDrop: f => loadFileToPad(i, f, false) });
+    drawGlassPanel(px, py, pw, ph, null, led.lit ? pCol : (isAct ? pCol : "rgba(180,220,255,0.18)"), led.lit ? 0.16 : 0);
+
+    ctx.save();
+    ctx.beginPath(); ctx.arc(px + 17, py + 18, 4.5, 0, Math.PI * 2);
+    if (led.lit) {
+      ctx.fillStyle = pCol; ctx.shadowColor = pCol; ctx.shadowBlur = 10; ctx.fill();
+      ctx.shadowBlur = 0; ctx.fillStyle = "#ffffff";
+      ctx.beginPath(); ctx.arc(px + 16, py + 17, 1.5, 0, Math.PI * 2); ctx.fill();
+    } else {
+      ctx.fillStyle = "#182230"; ctx.fill();
+      ctx.strokeStyle = "rgba(255,255,255,0.2)"; ctx.lineWidth = 1; ctx.stroke();
+    }
+    ctx.restore();
+
+    ctx.fillStyle = led.lit ? "#ffffff" : pCol; ctx.font = "bold 11px monospace";
+    ctx.fillText(`PAD ${i + 1}`, px + 28, py + 22);
+    drawRubberBtn(`padEd_${i}`, px + pw - 60, py + 7, 50, 22, "EDIT", { color: "#00ffcc", onClick: () => { activePad = i; switchTab("edit"); } });
+
+    const trigY = py + 36, trigH = Math.max(40, ph - 78);
+    drawRubberBtn(`padTrig_${i}`, px + 10, trigY, pw - 20, trigH, pad.rawBuf ? `▶ PAD ${i + 1} [${i + 1}]` : `EMPTY PAD ${i + 1}`, {
+      active: led.lit, color: pCol, font: "bold 12px monospace", ledProg: led.lit ? led.prog : -1, onClick: () => triggerPad(i)
+    });
+
+    const fy = py + ph - 34;
+    ctx.fillStyle = pad.rawBuf ? (led.lit ? "#ffffff" : "#e0f2ff") : "#55687a"; ctx.font = "10px monospace";
+    ctx.fillText(pad.name.slice(0, Math.floor((pw - 24) / 6.5)), px + 12, fy + 4);
+    const orig = getPadOrigBpm(pad);
+    ctx.fillStyle = "#88aacc"; ctx.fillText(`${G[pad.grd].name} | ${orig ? Math.round(orig * pad.pt) + " BPM" : "-- BPM"}`, px + 12, fy + 18);
+
+    drawRubberBtn(`padLp_${i}`, px + pw - 94, fy + 5, 46, 22, "LOOP", {
+      active: pad.loop, color: "#00ff88",
+      onClick: () => {
+        pushUndo("Toggle Pad Loop"); pad.loop = !pad.loop;
+        for (const v of liveVoices) if (v.ownerKey === `pad_${i}`) v.loop = pad.loop;
+      }
+    });
+    drawRubberBtn(`padSt_${i}`, px + pw - 44, fy + 5, 34, 22, "■", { color: "#ff4466", onClick: () => stopPadNode(pad) });
+  }
+}
+
+// --- TAB 2: WAVE EDITOR (WITH PAD SWITCHER) ---
+function drawEditorTab(x, y, w, h) {
+  const pad = pads[activePad];
+  const wavePanelH = Math.max(200, Math.min(270, Math.floor(h * 0.44)));
+  drawGlassPanel(x, y, w, wavePanelH, `WAVE EDITOR // PAD ${activePad + 1} : ${pad.name.slice(0, 22)}`);
+  dropZones.push({ x, y, w, h: wavePanelH, onDrop: f => loadFileToPad(activePad, f, true) });
+
+  const pBtnW = 28, pGap = 3, stripW = 8 * pBtnW + 7 * pGap;
+  let psx = x + w - stripW - 10;
+  for (let i = 0; i < 8; i++) {
+    const hasBuf = !!pads[i].rawBuf;
+    drawRubberBtn(`edPad_${i}`, psx, y + 3, pBtnW, 15, `P${i + 1}`, {
+      active: activePad === i,
+      color: hasBuf ? TRK_COLS[i] : "#55687a",
+      font: "bold 9px monospace",
+      onClick: () => {
+        if (edPlaying) stopEditorPlay();
+        activePad = i;
+        viewZoom = 1; viewOffset = 0;
+        ovCacheDirty = waveCacheDirty = true;
+        statusMsg = `WAVE EDITOR -> PAD ${i + 1}: ${pads[i].name}`;
+      }
+    });
+    psx += pBtnW + pGap;
+  }
+
+  const innerX = x + 10, innerW = w - 20;
+
+  let phNorm = -1, phSec = 0, phSource = "";
+  if (pad.rawBuf) {
+    if (edPlaying) {
+      phNorm = Math.max(0, Math.min(1, readPos / pad.rawBuf.length));
+      phSec = readPos / pad.rawBuf.sampleRate; phSource = "EDIT";
+    } else if ((seqRunning || stepRunning) && ac && pad.lastTrigTime >= 0) {
+      const elapsed = ac.currentTime - pad.lastTrigTime, dur = getPadOutDur(pad) / (pad.lastTrigRate || 1);
+      if (elapsed >= 0 && elapsed <= dur) {
+        phNorm = pad.st + (elapsed / Math.max(0.0001, dur)) * (pad.en - pad.st);
+        phSec = phNorm * pad.rawBuf.duration; phSource = seqRunning ? "SONG SYNC" : "STEP SYNC";
+      }
+    }
+  }
+
+  const ovY = y + 23, ovH = 34;
+  ovRect = { x: innerX, y: ovY, w: innerW, h: ovH };
+  if (ovCacheDirty || ovWfCv.width !== Math.floor(innerW) || ovWfCv.height !== ovH) renderOverviewCache(Math.floor(innerW), ovH);
+  ctx.drawImage(ovWfCv, innerX, ovY);
+  const vx = innerX + viewOffset * innerW, vw = Math.max(8, (1 / viewZoom) * innerW);
+  ctx.fillStyle = "rgba(0, 240, 255, 0.16)"; ctx.fillRect(vx, ovY, vw, ovH);
+  ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 1.3; ctx.strokeRect(vx + 0.5, ovY + 0.5, vw - 1, ovH - 1);
+  if (phNorm >= 0) {
+    const opx = innerX + phNorm * innerW;
+    ctx.strokeStyle = phSource === "EDIT" ? "#00ffaa" : "#ff44cc"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(opx, ovY); ctx.lineTo(opx, ovY + ovH); ctx.stroke();
+  }
+
+  const wvY = ovY + ovH + 5, wvH = Math.max(76, wavePanelH - 118);
+  waveRect = { x: innerX, y: wvY, w: innerW, h: wvH };
+  if (waveCacheDirty || wfCv.width !== Math.floor(innerW) || wfCv.height !== Math.floor(wvH)) renderWaveCache(Math.floor(innerW), Math.floor(wvH));
+  ctx.drawImage(wfCv, innerX, wvY);
+
+  if (phNorm >= 0) {
+    const px = innerX + ((phNorm - viewOffset) / (1 / viewZoom)) * innerW;
+    const isSync = phSource !== "EDIT";
+    if (px >= innerX - 2 && px <= innerX + innerW + 2) {
+      const trW = 24, tg = ctx.createLinearGradient(px - trW, 0, px, 0);
+      tg.addColorStop(0, "rgba(0,0,0,0)"); tg.addColorStop(1, isSync ? "rgba(255, 68, 204, 0.30)" : "rgba(0, 255, 170, 0.30)");
+      ctx.fillStyle = tg; ctx.fillRect(Math.max(innerX, px - trW), wvY, Math.min(trW, px - innerX), wvH);
+      ctx.strokeStyle = isSync ? "rgba(255, 68, 204, 0.65)" : "rgba(0, 255, 170, 0.65)"; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.moveTo(px, wvY); ctx.lineTo(px, wvY + wvH); ctx.stroke();
+      ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(px, wvY); ctx.lineTo(px, wvY + wvH); ctx.stroke();
+    }
+    const tStr = isSync ? `${phSource} ${phSec.toFixed(2)}s` : `T: ${phSec.toFixed(2)}s`;
+    ctx.font = "10px monospace"; const tw = ctx.measureText(tStr).width + 14;
+    ctx.fillStyle = "rgba(4,10,20,0.85)"; ctx.fillRect(innerX + innerW - tw - 6, wvY + wvH - 20, tw, 16);
+    ctx.fillStyle = isSync ? "#ff66dd" : "#00ffaa"; ctx.fillText(tStr, innerX + innerW - tw, wvY + wvH - 8);
+  }
+
+  const sbY = wvY + wvH + 5, sbH = 16;
+  drawRubberBtn("hScrL", innerX, sbY, 22, sbH, "◀", { onClick: () => { viewOffset -= (1 / viewZoom) * 0.25; clampView(); waveCacheDirty = true; } });
+  drawRubberBtn("hScrR", innerX + innerW - 22, sbY, 22, sbH, "▶", { onClick: () => { viewOffset += (1 / viewZoom) * 0.25; clampView(); waveCacheDirty = true; } });
+  const trkX = innerX + 26, trkW = innerW - 52;
+  hScrRect = { x: trkX, y: sbY, w: trkW, h: sbH };
+  ctx.fillStyle = "rgba(4, 8, 16, 0.85)"; rrect(ctx, trkX, sbY, trkW, sbH, 5); ctx.fill();
+  ctx.strokeStyle = "rgba(0, 240, 255, 0.22)"; rrect(ctx, trkX + 0.5, sbY + 0.5, trkW - 1, sbH - 1, 5); ctx.stroke();
+
+  const thumbW = Math.max(32, trkW * (1 / viewZoom)), maxOff = Math.max(0.00001, 1 - 1 / viewZoom);
+  const thumbX = trkX + (viewZoom > 1.001 ? (viewOffset / maxOff) * (trkW - thumbW) : 0);
+  hThumbRect = { x: thumbX, y: sbY + 2, w: thumbW, h: sbH - 4 };
+  ctx.fillStyle = viewZoom > 1.001 ? "rgba(0, 240, 255, 0.65)" : "rgba(110, 140, 170, 0.28)";
+  rrect(ctx, thumbX + 1, sbY + 2, thumbW - 2, sbH - 4, 4); ctx.fill();
+
+  const tbY = sbY + sbH + 6; let bx = innerX;
+  drawRubberBtn("zmIn", bx, tbY, 58, 22, "ZOOM +", { onClick: () => setZoom(viewZoom * 2) }); bx += 62;
+  drawRubberBtn("zmOut", bx, tbY, 60, 22, "ZOOM -", { onClick: () => setZoom(viewZoom / 2) }); bx += 64;
+  drawRubberBtn("zmFull", bx, tbY, 58, 22, "FULL 1x", { onClick: () => { viewZoom = 1; viewOffset = 0; clampView(); waveCacheDirty = true; } }); bx += 64;
+  drawRubberBtn("lockSE", bx, tbY, 102, 22, pad.lockSE ? "🔒 S/E LOCKED" : "🔓 LOCK S/E", {
+    active: pad.lockSE, color: "#ffaa00",
+    onClick: () => { pushUndo("Toggle S/E Lock"); pad.lockSE = !pad.lockSE; ovCacheDirty = waveCacheDirty = true; statusMsg = pad.lockSE ? "START & END LOCKED" : "START & END UNLOCKED"; }
+  }); bx += 110;
+  drawRubberBtn("edPlay", bx, tbY, 72, 22, "▶ PLAY", { active: edPlaying, color: "#00ff88", onClick: () => startEditorPlay() }); bx += 76;
+  drawRubberBtn("edStop", bx, tbY, 58, 22, "■ STOP", { color: "#ff4466", onClick: stopEditorPlay }); bx += 64;
+  drawRubberBtn("edSong", bx, tbY, 84, 22, seqRunning ? "■ SONG" : "▶ SONG", { active: seqRunning, color: "#ff44cc", onClick: () => seqRunning ? stopSeq() : startSeq() });
+  drawRubberBtn("edExp", innerX + innerW - 128, tbY, 128, 22, "EXPORT 202 WAV", { color: "#00f0ff", onClick: exportActivePadWav });
+
+  const cY = y + wavePanelH + 8, cH = h - wavePanelH - 8, colGap = 8, cW = (w - colGap * 2) / 3, sw = cW - 20;
+
+  // Col 1
+  drawGlassPanel(x, cY, cW, cH, "202 SAMPLER ENGINE + PITCH STEPPER");
+  let sy = cY + 24, sx = x + 10;
+  drawRubberBtn("grdBtn", sx, sy, sw - 108, 22, `GRADE: ${G[pad.grd].name}`, {
+    active: true, color: "#00f0ff", onClick: () => { pushUndo("Change 202 Grade"); pad.grd = (pad.grd + 1) % 4; pad.sr = G[pad.grd].sr; pad.dirty = true; waveCacheDirty = true; }
+  });
+  drawRubberBtn("lpBtn", sx + sw - 102, sy, 48, 22, "LOOP", { active: pad.loop, color: "#00ff88", onClick: () => { pushUndo("Toggle Loop"); pad.loop = !pad.loop; } });
+  drawRubberBtn("bypBtn", sx + sw - 50, sy, 50, 22, "BYP", { active: pad.bypass, color: "#ffaa00", onClick: () => { pushUndo("Toggle Bypass"); pad.bypass = !pad.bypass; pad.dirty = true; waveCacheDirty = true; } });
+  sy += 27;
+
+  const stNow = Math.round(12 * Math.log2(pad.pt)), stLbl = stNow > 0 ? `+${stNow} ST` : `${stNow} ST`, stBtnW = Math.floor((sw - 12) / 3);
+  drawRubberBtn("ptDn", sx, sy, stBtnW, 20, "-1 ST", { color: "#00f0ff", onClick: () => stepPadSemitone(pad, -1) });
+  drawRubberBtn("ptRst", sx + stBtnW + 6, sy, stBtnW, 20, stLbl, { active: stNow !== 0, color: "#00ffcc", onClick: () => { pushUndo("Reset Pitch"); pad.pt = 1; pad.dirty = true; waveCacheDirty = seqCacheDirty = true; } });
+  drawRubberBtn("ptUp", sx + (stBtnW + 6) * 2, sy, sw - (stBtnW + 6) * 2, 20, "+1 ST", { color: "#00f0ff", onClick: () => stepPadSemitone(pad, 1) });
+  sy += 25;
+
+  const sStep = Math.min(38, (cY + cH - sy - 4) / 5);
+  drawSlider("slSR", sx, sy, sw, 24, "SAMPLE RATE", pad.sr, 2000, 44100, `${Math.round(pad.sr)} Hz`, v => { pad.sr = Math.round(v); pad.dirty = true; waveCacheDirty = true; }); sy += sStep;
+  drawSlider("slPT", sx, sy, sw, 24, "PITCH / SPEED", pad.pt, 0.25, 2.5, `${pad.pt.toFixed(3)}x`, v => { pad.pt = v; const o = getPadOrigBpm(pad); if (o) pad.tgtBpm = Math.round(o * pad.pt); pad.dirty = true; waveCacheDirty = seqCacheDirty = true; }); sy += sStep;
+  drawSlider("slDRV", sx, sy, sw, 24, "PREAMP DRIVE", pad.drv, 0.5, 3.5, pad.drv.toFixed(2), v => { pad.drv = v; pad.dirty = true; waveCacheDirty = true; }); sy += sStep;
+  drawSlider("slST", sx, sy, sw, 24, "TRIM START", pad.st, 0, 0.99, `${(pad.st * 100).toFixed(1)}%`, v => { pad.st = Math.min(pad.en - 0.004, v); pad.dirty = true; ovCacheDirty = waveCacheDirty = true; }, { color: "#00f0ff", locked: pad.lockSE }); sy += sStep;
+  drawSlider("slEN", sx, sy, sw, 24, "TRIM END", pad.en, 0.01, 1, `${(pad.en * 100).toFixed(1)}%`, v => { pad.en = Math.max(pad.st + 0.004, v); pad.dirty = true; ovCacheDirty = waveCacheDirty = true; }, { color: "#ff2a85", locked: pad.lockSE });
+
+  // Col 2
+  const c2X = x + cW + colGap;
+  drawGlassPanel(c2X, cY, cW, cH, "SP-202 FX (24dB FILTER + RING MOD)");
+  let fy = cY + 24, fx = c2X + 10;
+  const fStep = Math.min(36, (cH - 86) / 4);
+  drawRubberBtn("fltMode", fx, fy, sw, 22, `FILTER: ${FMODES[pad.fMode]}`, { active: pad.fMode > 0, color: "#00ffcc", onClick: () => { pushUndo("Change Filter"); pad.fMode = (pad.fMode + 1) % 4; pad.dirty = true; waveCacheDirty = true; } }); fy += 27;
+  drawSlider("slCut", fx, fy, sw, 24, "FILTER CUT", pad.fCutNorm, 0, 1, `${pad.fCutHz} Hz`, v => { pad.fCutNorm = v; pad.fCutHz = Math.round(logMap(v, 35, 16000)); pad.dirty = true; }, { color: "#00ffcc" }); fy += fStep;
+  drawSlider("slRes", fx, fy, sw, 24, "FILTER RES", pad.fRes, 0, 1, `${Math.round(pad.fRes * 100)}%`, v => { pad.fRes = v; pad.dirty = true; }, { color: "#00ffcc" }); fy += fStep + 4;
+  drawRubberBtn("rmBtn", fx, fy, sw, 22, pad.rmOn ? "RING MOD: ON" : "RING MOD: OFF", { active: pad.rmOn, color: "#ff2a85", onClick: () => { pushUndo("Toggle Ring Mod"); pad.rmOn = !pad.rmOn; pad.dirty = true; waveCacheDirty = true; } }); fy += 27;
+  drawSlider("slRmF", fx, fy, sw, 24, "RING FREQ", pad.rmFreqNorm, 0, 1, `${pad.rmFreqHz} Hz`, v => { pad.rmFreqNorm = v; pad.rmFreqHz = Math.round(logMap(v, 20, 2500)); pad.dirty = true; }, { color: "#ff2a85" }); fy += fStep;
+  drawSlider("slRmM", fx, fy, sw, 24, "RING MIX", pad.rmMix, 0, 1, `${Math.round(pad.rmMix * 100)}%`, v => { pad.rmMix = v; pad.dirty = true; }, { color: "#ff2a85" });
+
+  // Col 3
+  const c3X = x + (cW + colGap) * 2, dx = c3X + 10, dlyH = Math.min(126, Math.floor(cH * 0.44));
+  drawGlassPanel(c3X, cY, cW, dlyH, "SP-202 LO-FI DELAY");
+  let dy = cY + 24;
+  drawRubberBtn("dlBtn", dx, dy, sw, 20, pad.dlOn ? "DELAY: ON" : "DELAY: OFF", { active: pad.dlOn, color: "#bb66ff", onClick: () => { pushUndo("Toggle Delay"); pad.dlOn = !pad.dlOn; pad.dirty = true; waveCacheDirty = true; } }); dy += 25;
+  const dStep = Math.min(34, (dlyH - 52) / 2);
+  drawSlider("slDlT", dx, dy, sw, 24, "DELAY TIME", pad.dlTime, 0.02, 1, `${Math.round(pad.dlTime * 1000)} ms`, v => { pad.dlTime = v; pad.dirty = true; }, { color: "#bb66ff" }); dy += dStep;
+  drawSlider("slDlA", dx, dy, sw, 24, "DELAY AMOUNT", pad.dlAmt, 0, 1, `${Math.round(pad.dlAmt * 100)}%`, v => { pad.dlAmt = v; pad.dirty = true; }, { color: "#bb66ff" });
+
+  const bpmY = cY + dlyH + 8, bpmH = cH - dlyH - 8;
+  drawGlassPanel(c3X, bpmY, cW, bpmH, "LOOP BPM CALCULATOR (PITCH-LINKED)", "rgba(0, 255, 170, 0.35)");
+  const orig = getPadOrigBpm(pad);
+  let by = bpmY + 25;
+  drawRubberBtn("btBtn", dx, by, sw * 0.52, 22, `BEATS: ${pad.beats}`, { color: "#00ffcc", onClick: () => { pushUndo("Change Beats"); pad.beats = BEATS_OPT[(BEATS_OPT.indexOf(pad.beats) + 1) % BEATS_OPT.length]; pad.dirty = true; } });
+  ctx.fillStyle = "#88e8ff"; ctx.font = "bold 10px monospace"; ctx.fillText(`ORIG: ${orig ? orig.toFixed(1) : "--"}`, dx + sw * 0.56, by + 15);
+  by += 28;
+
+  drawRubberBtn("bpmDn", dx, by, 48, 26, "-1 BPM", { color: "#00f0ff", onClick: () => { pushUndo("Pad BPM -1"); fitPadToBpm(pad, (orig ? Math.round(orig * pad.pt) : pad.tgtBpm) - 1); waveCacheDirty = seqCacheDirty = true; } });
+  ctx.fillStyle = "rgba(4,10,20,0.88)"; rrect(ctx, dx + 54, by, sw - 108, 26, 6); ctx.fill();
+  ctx.strokeStyle = "rgba(0,255,170,0.45)"; rrect(ctx, dx + 54.5, by + 0.5, sw - 109, 25, 6); ctx.stroke();
+  ctx.fillStyle = "#00ffcc"; ctx.font = "bold 13px monospace"; ctx.textAlign = "center";
+  ctx.fillText(`${orig ? Math.round(orig * pad.pt) : pad.tgtBpm} BPM`, dx + sw / 2, by + 17);
+  ctx.textAlign = "left";
+  drawRubberBtn("bpmUp", dx + sw - 48, by, 48, 26, "+1 BPM", { color: "#00f0ff", onClick: () => { pushUndo("Pad BPM +1"); fitPadToBpm(pad, (orig ? Math.round(orig * pad.pt) : pad.tgtBpm) + 1); waveCacheDirty = seqCacheDirty = true; } });
+  by += 32;
+  drawRubberBtn("syncSeq", dx, by, sw, Math.min(24, bpmY + bpmH - by - 6), `SYNC TO SONG BPM (${seqBpm})`, {
+    color: "#00ff88", onClick: () => { pushUndo("Sync Pad BPM"); fitPadToBpm(pad, seqBpm); waveCacheDirty = seqCacheDirty = true; statusMsg = `PAD ${activePad + 1} LOCKED TO ${seqBpm} BPM`; }
+  });
+}
+
+// --- TAB 3: 64-BAR ZOOMABLE SONG TIMELINE ---
+function drawTimelineTab(x, y, w, h) {
+  const tbH = 74;
+  drawGlassPanel(x, y, w, tbH, "SONG TIMELINE (CLICK CLIP=DRAG // DRAG EMPTY=PAINT // CTRL+X CUT // CTRL+Z UNDO // CLR=DEL SEL)");
+  let bx = x + 10, by = y + 23;
+  drawRubberBtn("sPlay", bx, by, 56, 22, "▶ PLAY", { active: seqRunning, color: "#00ff88", onClick: startSeq }); bx += 60;
+  drawRubberBtn("sStop", bx, by, 46, 22, "■ STOP", { color: "#ff4466", onClick: stopSeq }); bx += 50;
+  drawRubberBtn("sLoop", bx, by, 42, 22, "LOOP", { active: seqLoopOn, color: "#00ff88", onClick: () => { pushUndo("Toggle Loop"); seqLoopOn = !seqLoopOn; seqCacheDirty = true; } }); bx += 46;
+  drawRubberBtn("sBpmDn", bx, by, 20, 22, "-", { onClick: () => setSeqBpm(seqBpm - 1) }); bx += 22;
+  ctx.fillStyle = "#00ffcc"; ctx.font = "bold 10px monospace"; ctx.fillText(`${seqBpm}BPM`, bx + 2, by + 15); bx += 42;
+  drawRubberBtn("sBpmUp", bx, by, 20, 22, "+", { onClick: () => setSeqBpm(seqBpm + 1) }); bx += 24;
+  drawRubberBtn("sBars", bx, by, 54, 22, `${seqBars} BAR`, { onClick: () => setSeqBars(BARS_OPT[(BARS_OPT.indexOf(seqBars) + 1) % BARS_OPT.length]) }); bx += 58;
+
+  drawRubberBtn("sToolP", bx, by, 50, 22, "PAINT", {
+    active: seqTool === "paint", color: "#00f0ff",
+    onClick: () => { seqTool = "paint"; statusMsg = "PAINT / DRAG MODE (CLICK CLIP TO MOVE, DRAG EMPTY TO PAINT END-TO-END)"; }
+  }); bx += 53;
+  drawRubberBtn("sToolS", bx, by, 54, 22, "SELECT", {
+    active: seqTool === "select", color: "#00ffcc",
+    onClick: () => { seqTool = "select"; statusMsg = "RECTANGLE SELECT MODE: DRAG BOX OVER CLIPS -> CTRL+X / CTRL+C / CTRL+V"; }
+  }); bx += 57;
+  drawRubberBtn("sCopy", bx, by, 42, 22, "COPY", { active: !!seqSel, color: "#00ffcc", onClick: copySeqSelection }); bx += 45;
+  drawRubberBtn("sPaste", bx, by, 46, 22, "PASTE", { active: !!seqClipboard, color: "#ffaa00", onClick: () => pasteSeqClipboard() }); bx += 50;
+
+  drawRubberBtn("sAddSt", bx, by, 52, 22, "+ STEP", { color: "#ffaa00", onClick: () => { pushUndo("Add Step Track"); seqTracks.push(makeSeqTrack("step", 0)); seqCacheDirty = true; } }); bx += 55;
+  drawRubberBtn("sAddLp", bx, by, 52, 22, "+ LOOP", { color: "#00f0ff", onClick: () => { pushUndo("Add Loop Track"); seqTracks.push(makeSeqTrack("loop", activePad)); seqCacheDirty = true; } }); bx += 55;
+  drawRubberBtn("sClr", bx, by, 36, 22, "CLR", { active: !!seqSel, color: "#ff4466", onClick: clearSelectionOrSong });
+  drawRubberBtn("sExp", x + w - 82, by, 72, 22, "EXPORT", { color: "#00f0ff", onClick: exportTimelineWav });
+
+  const brY = y + 49; let brX = x + 10;
+  ctx.fillStyle = "#ffaa00"; ctx.font = "bold 10px monospace"; ctx.fillText("SNAP:", brX, brY + 13); brX += 34;
+  for (let i = 0; i < SEQ_SNAPS.length; i++) {
+    const sp = SEQ_SNAPS[i];
+    drawRubberBtn("snap_" + i, brX, brY, 52, 18, sp.short, {
+      active: seqSnapIdx === i, color: "#ffaa00",
+      onClick: () => { seqSnapIdx = i; seqCacheDirty = true; statusMsg = `QUANTIZE SNAP: ${sp.label}`; }
+    });
+    brX += 55;
+  }
+  brX += 8;
+  ctx.fillStyle = "#88ccff"; ctx.font = "bold 10px monospace"; ctx.fillText("PAT:", brX, brY + 13); brX += 30;
+  for (let p = 1; p <= 8; p++) {
+    drawRubberBtn("br_" + p, brX, brY, 26, 18, `P${p}`, { active: seqBrushPat === p, color: PAT_COLS[p - 1], onClick: () => { seqBrushPat = p; seqTool = "paint"; } });
+    brX += 29;
+  }
+  drawRubberBtn("br_0", brX, brY, 38, 18, "ERS", { active: seqBrushPat === 0, color: "#ff4466", onClick: () => { seqBrushPat = 0; seqTool = "paint"; } }); brX += 44;
+  if (x + w - brX > 95) drawSlider("seqSw", brX, brY - 5, Math.min(135, x + w - brX - 10), 22, "SWING", stepSwing, 0, 1, `${Math.round(stepSwing * 100)}%`, v => { stepSwing = v; });
+
+  const gridY = y + tbH + 6, gridH = Math.max(170, Math.floor((h - tbH - 34) * 0.56));
+  const gx = x + 6, gw = w - 12;
+  seqGridRect = { x: gx, y: gridY, w: gw, h: gridH };
+  seqLoopRect = { x: gx + SEQ_GRID_X, y: gridY, w: gw - SEQ_GRID_X, h: SEQ_LOOP_H };
+  seqScrubRect = { x: gx + SEQ_GRID_X, y: gridY + SEQ_LOOP_H, w: gw - SEQ_GRID_X, h: SEQ_SCRUB_H };
+
+  if (seqCacheDirty || seqCacheCv.width !== Math.floor(gw) || seqCacheCv.height !== Math.floor(gridH)) renderSeqCache(Math.floor(gw), Math.floor(gridH));
+  ctx.drawImage(seqCacheCv, gx, gridY);
+
+  dropZones.push({
+    x: gx, y: gridY + SEQ_TOP_H, w: gw, h: gridH - SEQ_TOP_H,
+    onDrop: (f, dx, dy) => {
+      const rowH = (gridH - SEQ_TOP_H) / Math.max(1, seqTracks.length);
+      const t = Math.floor((dy - (gridY + SEQ_TOP_H)) / rowH);
+      loadFileToPad((t >= 0 && t < seqTracks.length && seqTracks[t].mode === "loop") ? seqTracks[t].padIdx : activePad, f, false);
+    }
+  });
+
+  // Live 6-Segment LED VU Meters (Directly from Real-Time DSP Loop)
+  const rowH = (gridH - SEQ_TOP_H) / Math.max(1, seqTracks.length), ledCnt = 6;
+  for (let t = 0; t < seqTracks.length; t++) {
+    const trk = seqTracks[t];
+    const peak = seqRunning ? trk.vuPeak : 0;
+    trk.vuLevel = Math.max(peak, trk.vuLevel * 0.82);
+    const lit = Math.min(ledCnt, Math.ceil(trk.vuLevel * 7.5));
+    const yBase = gridY + SEQ_TOP_H + t * rowH + rowH - 3, ledH = Math.max(2, (rowH - 12) / ledCnt);
+    for (let s = 0; s < ledCnt; s++) {
+      const ly = yBase - (s + 1) * (ledH + 1);
+      ctx.fillStyle = s < lit ? (s >= 5 ? "#ff3333" : (s >= 3 ? "#ffcc00" : "#00ff66")) : "#152030";
+      ctx.fillRect(gx + SEQ_HDR_W + 4, ly, SEQ_VU_W - 8, ledH);
+    }
+  }
+
+  const visBars = seqBars / seqZoom, startBarF = seqScroll * seqBars;
+  const gridBodyW = gw - SEQ_GRID_X;
+  const barToScreenX = b => gx + SEQ_GRID_X + ((b - startBarF) / visBars) * gridBodyW;
+
+  if (seqSel) {
+    ctx.save();
+    ctx.beginPath(); ctx.rect(gx + SEQ_GRID_X, gridY + SEQ_TOP_H, gridBodyW, gridH - SEQ_TOP_H); ctx.clip();
+    const sx0 = barToScreenX(seqSel.k0 / TICKS_PER_BAR);
+    const sx1 = barToScreenX(seqSel.k1 / TICKS_PER_BAR);
+    const sy0 = gridY + SEQ_TOP_H + seqSel.t0 * rowH;
+    const sy1 = gridY + SEQ_TOP_H + (seqSel.t1 + 1) * rowH;
+    const sw = Math.max(4, sx1 - sx0), sh = Math.max(4, sy1 - sy0);
+
+    ctx.fillStyle = "rgba(0, 240, 255, 0.14)";
+    ctx.fillRect(sx0, sy0, sw, sh);
+    ctx.strokeStyle = "#00f0ff";
+    ctx.lineWidth = 1.6;
+    ctx.setLineDash([5, 3]);
+    ctx.strokeRect(sx0 + 0.5, sy0 + 0.5, sw - 1, sh - 1);
+    ctx.setLineDash([]);
+
+    ctx.fillStyle = "#00f0ff";
+    ctx.fillRect(sx0 - 2, sy0 - 2, 5, 5);
+    ctx.fillRect(sx0 + sw - 3, sy0 - 2, 5, 5);
+    ctx.fillRect(sx0 - 2, sy0 + sh - 3, 5, 5);
+    ctx.fillRect(sx0 + sw - 3, sy0 + sh - 3, 5, 5);
+
+    const selBeats = ((seqSel.k1 - seqSel.k0) / 2).toFixed(1);
+    const tag = `GROUP: ${selBeats}B × ${seqSel.t1 - seqSel.t0 + 1}T [CTRL+X / CTRL+C / DEL]`;
+    ctx.font = "bold 9px monospace";
+    const tw = ctx.measureText(tag).width + 10;
+    ctx.fillStyle = "rgba(4, 14, 26, 0.88)";
+    ctx.fillRect(Math.max(gx + SEQ_GRID_X + 2, sx0), Math.max(gridY + SEQ_TOP_H + 2, sy0 - 14), tw, 13);
+    ctx.fillStyle = "#00ffcc";
+    ctx.fillText(tag, Math.max(gx + SEQ_GRID_X + 6, sx0 + 4), Math.max(gridY + SEQ_TOP_H + 11, sy0 - 4));
+    ctx.restore();
+  }
+
+  const playBarF = getSeqPlayheadBarF();
+  const px = barToScreenX(playBarF);
+  if (px >= gx + SEQ_GRID_X - 2 && px <= gx + gw + 2) {
+    ctx.strokeStyle = seqRunning ? "#ffffff" : "#00f0ff"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(px, gridY + SEQ_LOOP_H); ctx.lineTo(px, gridY + gridH); ctx.stroke();
+    ctx.fillStyle = seqRunning ? "#00ffaa" : "#00f0ff";
+    ctx.beginPath(); ctx.moveTo(px, gridY + SEQ_TOP_H); ctx.lineTo(px - 6, gridY + SEQ_LOOP_H + 2); ctx.lineTo(px + 6, gridY + SEQ_LOOP_H + 2); ctx.closePath(); ctx.fill();
+  }
+
+  const sSbY = gridY + gridH + 5, sSbH = 16;
+  drawRubberBtn("szIn", gx, sSbY, 34, sSbH, "Z+", { onClick: () => setSeqZoom(seqZoom * 1.5) });
+  drawRubberBtn("szOut", gx + 38, sSbY, 34, sSbH, "Z-", { onClick: () => setSeqZoom(seqZoom / 1.5) });
+  drawRubberBtn("sz1x", gx + 76, sSbY, 34, sSbH, "1x", { onClick: () => { seqZoom = 1; seqScroll = 0; seqCacheDirty = true; } });
+
+  const sLBtnX = gx + SEQ_GRID_X;
+  drawRubberBtn("sScrL", sLBtnX, sSbY, 22, sSbH, "◀", { onClick: () => { seqScroll -= (1 / seqZoom) * 0.25; clampSeqView(); seqCacheDirty = true; } });
+  drawRubberBtn("sScrR", gx + gw - 22, sSbY, 22, sSbH, "▶", { onClick: () => { seqScroll += (1 / seqZoom) * 0.25; clampSeqView(); seqCacheDirty = true; } });
+
+  const sTrkX = sLBtnX + 26, sTrkW = (gx + gw - 26) - sTrkX;
+  seqHScrRect = { x: sTrkX, y: sSbY, w: sTrkW, h: sSbH };
+  ctx.fillStyle = "rgba(4, 8, 16, 0.85)"; rrect(ctx, sTrkX, sSbY, sTrkW, sSbH, 5); ctx.fill();
+  ctx.strokeStyle = "rgba(0, 240, 255, 0.22)"; rrect(ctx, sTrkX + 0.5, sSbY + 0.5, sTrkW - 1, sSbH - 1, 5); ctx.stroke();
+
+  const sThumbW = Math.max(30, sTrkW * (1 / seqZoom)), sMaxOff = Math.max(0.00001, 1 - 1 / seqZoom);
+  const sThumbX = sTrkX + (seqZoom > 1.001 ? (seqScroll / sMaxOff) * (sTrkW - sThumbW) : 0);
+  seqHThumbRect = { x: sThumbX, y: sSbY + 2, w: sThumbW, h: sSbH - 4 };
+  ctx.fillStyle = seqZoom > 1.001 ? "rgba(0, 240, 255, 0.65)" : "rgba(110, 140, 170, 0.28)";
+  rrect(ctx, sThumbX + 1, sSbY + 2, sThumbW - 2, sSbH - 4, 4); ctx.fill();
+
+  const mixY = sSbY + sSbH + 6, mixH = y + h - mixY;
+  drawGlassPanel(x, mixY, w, mixH, "LIVE REAL-TIME MIXER (STEP & LOOP TRACKS)");
+  const mRowH = Math.min(25, (mixH - 26) / Math.max(1, seqTracks.length));
+  for (let t = 0; t < seqTracks.length; t++) {
+    const trk = seqTracks[t], ry = mixY + 22 + t * mRowH, col = TRK_COLS[t % TRK_COLS.length];
+    if (ry + mRowH > mixY + mixH - 2) break;
+    ctx.fillStyle = col; ctx.font = "bold 10px monospace";
+    ctx.fillText(`T${t + 1} ${trk.mode === "step" ? "[STEP]" : "[LOOP]"}`, x + 10, ry + 14);
+    if (trk.mode === "loop") {
+      drawRubberBtn(`mSrc_${t}`, x + 94, ry + 2, 134, mRowH - 4, `PAD ${trk.padIdx + 1}: ${pads[trk.padIdx].name.slice(0, 8)}`, { onClick: () => { pushUndo("Change Track Pad"); trk.padIdx = (trk.padIdx + 1) % 8; seqCacheDirty = true; } });
+    } else {
+      drawRubberBtn(`mSrc_${t}`, x + 94, ry + 2, 134, mRowH - 4, "STEP SEQ (P1-P8)", { color: "#ffaa00", onClick: () => switchTab("step") });
+    }
+    const slW = Math.max(90, w - 456);
+    drawSlider(`mVol_${t}`, x + 236, ry - 4, slW, mRowH, "", trk.vol, 0, 1.25, `${Math.round(trk.vol * 100)}%`, v => { trk.vol = v; }, { color: col });
+    let ax = x + 246 + slW;
+    drawRubberBtn(`mMut_${t}`, ax, ry + 2, 42, mRowH - 4, "MUTE", { active: trk.mute, color: "#ff3355", onClick: () => { pushUndo("Toggle Track Mute"); trk.mute = !trk.mute; seqCacheDirty = true; } }); ax += 46;
+    drawRubberBtn(`mFil_${t}`, ax, ry + 2, 42, mRowH - 4, "FILL", {
+      onClick: () => {
+        pushUndo(`Fill Track ${t + 1}`);
+        const val = trk.mode === "step" ? (seqBrushPat || 1) : 1;
+        const stepK = getClipSpanTicks(trk);
+        trk.cells.fill(0);
+        for (let k = 0; k < seqBars * TICKS_PER_BAR; k += stepK) trk.cells[k] = val;
+        seqCacheDirty = true;
+      }
+    }); ax += 46;
+    drawRubberBtn(`mClr_${t}`, ax, ry + 2, 38, mRowH - 4, "CLR", { onClick: () => { pushUndo(`Clear Track ${t + 1}`); trk.cells.fill(0); seqCacheDirty = true; } }); ax += 42;
+    if (seqTracks.length > 1) {
+      drawRubberBtn(`mDel_${t}`, ax, ry + 2, 26, mRowH - 4, "X", { color: "#ff4466", onClick: () => { pushUndo(`Delete Track ${t + 1}`); stopAllVoices(false); seqTracks.splice(t, 1); seqCacheDirty = true; } });
+    }
+  }
+}
+
+// --- TAB 4: 8-PATTERN STEP SEQUENCER + STEP PITCHER ---
+const ST_HDR_W = 134, ST_TOP_H = 24;
+function drawStepTab(x, y, w, h) {
+  const tbH = 54;
+  const modeHint = stepEditMode === "pitch" ? "DRAG STEP UP/DOWN FOR -12/+12 ST // RIGHT-CLICK RESET" : "DBL-CLICK TRACK TITLE -> WAVE EDITOR // CLICK/DRAG STEPS";
+  drawGlassPanel(x, y, w, tbH, `STEP SEQUENCER // PATTERN P${activeStepPat + 1} // ${modeHint}`);
+  let bx = x + 10, by = y + 25;
+  for (let i = 0; i < 8; i++) {
+    drawRubberBtn("sp_" + i, bx, by, 30, 22, `P${i + 1}`, { active: activeStepPat === i, color: PAT_COLS[i], onClick: () => { activeStepPat = i; } });
+    bx += 34;
+  }
+  bx += 6;
+  drawRubberBtn("stPlay", bx, by, 62, 22, "▶ PLAY", { active: stepRunning, color: "#00ff88", onClick: startStepPat }); bx += 66;
+  drawRubberBtn("stStop", bx, by, 50, 22, "■ STOP", { color: "#ff4466", onClick: stopStepPat }); bx += 56;
+  drawRubberBtn("stMode", bx, by, 98, 22, stepEditMode === "pitch" ? "MODE: PITCH" : "MODE: STEPS", {
+    active: stepEditMode === "pitch", color: "#ffaa00",
+    onClick: () => { stepEditMode = stepEditMode === "trig" ? "pitch" : "trig"; statusMsg = stepEditMode === "pitch" ? "STEP PITCHER ACTIVE" : "STEP TRIGGER MODE"; }
+  }); bx += 104;
+  drawRubberBtn("stCpy", bx, by, 40, 22, "COPY", { onClick: () => { stepClip = stepPats[activeStepPat].map(r => new Uint8Array(r)); stepPitchClip = stepPitches[activeStepPat].map(r => new Int8Array(r)); statusMsg = `COPIED PATTERN P${activeStepPat + 1}`; } }); bx += 44;
+  drawRubberBtn("stPst", bx, by, 44, 22, "PASTE", { onClick: () => { if (stepClip) { pushUndo("Paste Pattern"); stepPats[activeStepPat] = stepClip.map(r => new Uint8Array(r)); stepPitches[activeStepPat] = stepPitchClip.map(r => new Int8Array(r)); seqCacheDirty = true; } } }); bx += 48;
+  drawRubberBtn("stRnd", bx, by, 44, 22, "RAND", { onClick: () => { pushUndo("Randomize Pattern"); const pat = stepPats[activeStepPat]; for (let p = 0; p < 8; p++) for (let s = 0; s < 16; s++) pat[p][s] = (pads[p].rawBuf && Math.random() < (s % 4 === 0 ? 0.55 : 0.2)) ? 1 : 0; seqCacheDirty = true; } }); bx += 48;
+  drawRubberBtn("stClr", bx, by, 38, 22, "CLR", { onClick: () => { pushUndo("Clear Pattern"); stepPats[activeStepPat].forEach(r => r.fill(0)); stepPitches[activeStepPat].forEach(r => r.fill(0)); seqCacheDirty = true; } }); bx += 46;
+  if (x + w - bx > 96) drawSlider("stSw", bx, by - 4, Math.min(140, x + w - bx - 10), 22, "SWING", stepSwing, 0, 1, `${Math.round(stepSwing * 100)}%`, v => { stepSwing = v; });
+
+  const gy = y + tbH + 8, gh = h - tbH - 8;
+  drawGlassPanel(x, gy, w, gh);
+  const gx = x + 10, ggy = gy + 10, gw = w - 20, ggh = gh - 20;
+  stepGridRect = { x: gx, y: ggy, w: gw, h: ggh };
+
+  dropZones.push({
+    x: gx, y: ggy, w: gw, h: ggh,
+    onDrop: (f, dx, dy) => {
+      const p = Math.floor((dy - (ggy + ST_TOP_H)) / ((ggh - ST_TOP_H) / 8));
+      loadFileToPad(p >= 0 && p < 8 ? p : activePad, f, false);
+    }
+  });
+
+  const pat = stepPats[activeStepPat], pitches = stepPitches[activeStepPat];
+  const colW = (gw - ST_HDR_W) / 16, rowH = (ggh - ST_TOP_H) / 8, pCol = PAT_COLS[activeStepPat];
+  ctx.fillStyle = "rgba(4, 8, 16, 0.78)"; rrect(ctx, gx, ggy, gw, ggh, 6); ctx.fill();
+  ctx.fillStyle = pCol; ctx.font = "bold 10px monospace"; ctx.fillText(`PAT P${activeStepPat + 1} // DBL-CLICK`, gx + 8, ggy + 16);
+
+  for (let s = 0; s < 16; s++) {
+    const sx = gx + ST_HDR_W + s * colW;
+    if (s === stepDrawCur) { ctx.fillStyle = "rgba(0, 255, 170, 0.18)"; ctx.fillRect(sx, ggy, colW, ggh); }
+    ctx.strokeStyle = s % 4 === 0 ? "rgba(0,240,255,0.34)" : "rgba(0,240,255,0.09)";
+    ctx.beginPath(); ctx.moveTo(sx + 0.5, ggy); ctx.lineTo(sx + 0.5, ggy + ggh); ctx.stroke();
+    ctx.fillStyle = s === stepDrawCur ? "#ffffff" : (s % 4 === 0 ? "#00ffcc" : "#557799");
+    ctx.font = "10px monospace"; ctx.fillText(String(s + 1), sx + 6, ggy + 16);
+  }
+
+  for (let p = 0; p < 8; p++) {
+    const py = ggy + ST_TOP_H + p * rowH;
+    ctx.strokeStyle = "rgba(0,240,255,0.12)"; ctx.beginPath(); ctx.moveTo(gx, py + 0.5); ctx.lineTo(gx + gw, py + 0.5); ctx.stroke();
+    ctx.fillStyle = pads[p].rawBuf ? TRK_COLS[p] : "#334455"; ctx.fillRect(gx + 3, py + 4, 4, rowH - 8);
+    ctx.fillStyle = pads[p].rawBuf ? "#ddeeff" : "#556677"; ctx.font = "10px monospace";
+    ctx.fillText(`P${p + 1}: ${pads[p].name.slice(0, 12)}`, gx + 12, py + rowH / 2 + 4);
+
+    for (let s = 0; s < 16; s++) {
+      const sx = gx + ST_HDR_W + s * colW, on = pat[p][s], semi = pitches[p][s];
+      const bx2 = sx + 3, by2 = py + 4, bw2 = Math.max(6, colW - 6), bh2 = rowH - 8;
+      ctx.fillStyle = on ? (stepEditMode === "pitch" ? "#263246" : pCol) : (Math.floor(s / 4) % 2 === 0 ? "#18202c" : "#111720");
+      rrect(ctx, bx2, by2, bw2, bh2, 4); ctx.fill();
+
+      if (on && (stepEditMode === "pitch" || semi !== 0)) {
+        const midY = by2 + bh2 / 2, barH = (semi / 12) * (bh2 / 2 - 2);
+        ctx.fillStyle = semi >= 0 ? "#00ffcc" : "#ff4488";
+        if (semi >= 0) ctx.fillRect(bx2 + 2, midY - barH, bw2 - 4, Math.max(2, barH));
+        else ctx.fillRect(bx2 + 2, midY, bw2 - 4, Math.max(2, -barH));
+      }
+      ctx.strokeStyle = on ? (stepEditMode === "pitch" ? "#ffaa00" : "#ffffff") : "rgba(255,255,255,0.1)";
+      rrect(ctx, bx2 + 0.5, by2 + 0.5, bw2 - 1, bh2 - 1, 4); ctx.stroke();
+      if (on && (stepEditMode === "pitch" || semi !== 0)) {
+        ctx.fillStyle = stepEditMode === "pitch" ? "#ffffff" : "#000000";
+        ctx.font = "bold 9px monospace"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText(semi > 0 ? `+${semi}` : String(semi), bx2 + bw2 / 2, by2 + bh2 / 2);
+        ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+      }
+    }
+  }
+}
+
+// ==========================================
+// 12. TAB SWITCHING & RENDER LOOP (0% IDLE CPU)
+// ==========================================
+function switchTab(tab) {
+  if (activeTab === "edit" && tab !== "edit") stopEditorPlay();
+  if (activeTab === "step" && tab === "seq") stopStepPat();
+  activeTab = tab;
+  openMenu = null;
+  if (tab === "edit") { ovCacheDirty = waveCacheDirty = true; }
+  if (tab === "seq") {
+    pads.forEach(p => { if (p.rawBuf && !p.miniPeaks) p.miniPeaks = computeMiniPeaks(p.rawBuf); });
+    seqCacheDirty = true;
+  }
+  requestDraw();
+}
+
+function requestDraw() { needRedraw = true; if (!rafId) rafId = requestAnimationFrame(tick); }
+function ensureAnim() { if (!rafId) rafId = requestAnimationFrame(tick); }
+function tick() {
+  rafId = 0;
+  const anyPadLit = pads.some(p => p.trigs.length > 0);
+  const live = edPlaying || seqRunning || stepRunning || anyPadLit || activeDrag || activeSlider;
+  if (needRedraw || live) { needRedraw = false; draw(); }
+  if (live) rafId = requestAnimationFrame(tick);
+}
+
+// ==========================================
+// 13. POINTER, CLIP DRAG, NON-OVERLAPPING PAINT & SHORTCUTS
+// ==========================================
+function updateSliderFromX(sl, px) {
+  sl.onChange(sl.min + Math.max(0, Math.min(1, (px - sl.x) / sl.w)) * (sl.max - sl.min));
+  requestDraw();
+}
+function panOverviewAt(px) {
+  if (!ovRect) return;
+  viewOffset = Math.max(0, Math.min(1, (px - ovRect.x) / ovRect.w)) - (1 / viewZoom) * 0.5;
+  clampView(); waveCacheDirty = true; requestDraw();
+}
+
+function seqXToBarF(px) {
+  if (!seqGridRect) return 0;
+  const gx = seqGridRect.x + SEQ_GRID_X, gw = seqGridRect.w - SEQ_GRID_X;
+  return seqScroll * seqBars + ((px - gx) / gw) * (seqBars / seqZoom);
+}
+
+function getSeqTrackAndTick(px, py) {
+  if (!seqGridRect) return null;
+  const gx = seqGridRect.x + SEQ_GRID_X, gy = seqGridRect.y + SEQ_TOP_H;
+  const gw = seqGridRect.w - SEQ_GRID_X, gh = seqGridRect.h - SEQ_TOP_H;
+  const snapTicks = SEQ_SNAPS[seqSnapIdx].ticks;
+  const rawTick = Math.max(0, Math.min(seqBars * TICKS_PER_BAR - 1, Math.floor(seqXToBarF(px) * TICKS_PER_BAR)));
+  const k = Math.max(0, Math.min(seqBars * TICKS_PER_BAR - snapTicks, Math.floor(rawTick / snapTicks) * snapTicks));
+  const t = Math.max(0, Math.min(seqTracks.length - 1, Math.floor(((py - gy) / gh) * seqTracks.length)));
+  return { t, k, rawTick, snapTicks };
+}
+
+function handleSeqCellInteract(px, py, isDrag, isRight, shiftKey, altKey) {
+  if (!seqGridRect) return;
+  const gx = seqGridRect.x + SEQ_GRID_X, gy = seqGridRect.y + SEQ_TOP_H;
+  const gw = seqGridRect.w - SEQ_GRID_X, gh = seqGridRect.h - SEQ_TOP_H;
+  if (px < gx || py < gy || px > gx + gw || py > gy + gh) return;
+
+  const { t, k, rawTick, snapTicks } = getSeqTrackAndTick(px, py);
+  const trk = seqTracks[t];
+  const hitClip = findClipAtTick(trk, rawTick);
+
+  if (isRight) {
+    if (!isDrag) pushUndo("Delete Clip");
+    if (hitClip) trk.cells[hitClip.startK] = 0;
+    else trk.cells[k] = 0;
+    if (!isDrag) activeDrag = { type: "seqErase" };
+    statusMsg = `DELETED CLIP ON T${t + 1}`;
+    seqCacheDirty = true; requestDraw(); return;
+  }
+
+  if (!isDrag) {
+    const now = performance.now();
+    const clickId = hitClip ? `clip_${t}_${hitClip.startK}` : `cell_${t}_${k}`;
+    if (now - lastClick.t < 340 && lastClick.key === clickId) {
+      lastClick.t = 0;
+      activeDrag = null;
+      if (trk.mode === "step") {
+        const pNum = hitClip ? hitClip.val : (seqBrushPat || 1);
+        activeStepPat = pNum - 1;
+        switchTab("step");
+      } else {
+        activePad = trk.padIdx;
+        switchTab("edit");
+      }
+      return;
+    }
+    lastClick = { t: now, key: clickId };
+  }
+
+  if (!isDrag && (seqTool === "select" || shiftKey)) {
+    if (!shiftKey && seqSel && t >= seqSel.t0 && t <= seqSel.t1 && rawTick >= seqSel.k0 && rawTick < seqSel.k1) {
+      pushUndo(altKey ? "Clone Group" : "Move Group");
+      const items = [];
+      for (let st = seqSel.t0; st <= seqSel.t1; st++) {
+        for (let sk = seqSel.k0; sk < seqSel.k1; sk++) {
+          if (seqTracks[st].cells[sk]) items.push({ dt: st - seqSel.t0, dk: sk - seqSel.k0, val: seqTracks[st].cells[sk] });
+        }
+      }
+      const backup = seqTracks.map(tr => new Uint8Array(tr.cells));
+      activeDrag = { type: "seqGroupMove", startT: t, startK: k, origSel: { ...seqSel }, items, backup, clone: !!altKey };
+      statusMsg = altKey ? "CLONE-DRAGGING GROUPED CLIPS..." : "MOVING GROUPED CLIPS...";
+      return;
+    }
+    seqSel = { t0: t, t1: t, k0: k, k1: k + snapTicks };
+    seqPasteAnchor = { t, k };
+    activeDrag = { type: "seqMarquee", anchorT: t, anchorK: k };
+    seqCacheDirty = true;
+    statusMsg = "DRAG RECTANGLE TO GROUP CLIPS -> CTRL+X / CTRL+C / CTRL+V / CLR";
+    requestDraw();
+    return;
+  }
+
+  if (!isDrag && hitClip && seqBrushPat !== 0) {
+    pushUndo(altKey ? "Clone Clip" : "Move Clip");
+    seqPasteAnchor = { t, k: hitClip.startK };
+    activeDrag = {
+      type: "seqMoveSingle",
+      trackIdx: t,
+      origK: hitClip.startK,
+      curK: hitClip.startK,
+      grabOffsetTicks: rawTick - hitClip.startK,
+      val: hitClip.val,
+      backup: new Uint8Array(trk.cells),
+      clone: !!altKey
+    };
+    statusMsg = `DRAGGING CLIP ON T${t + 1} (DOUBLE-CLICK TO EDIT // RIGHT-CLICK TO DELETE)`;
+    requestDraw();
+    return;
+  }
+
+  if (!isDrag) {
+    seqPasteAnchor = { t, k };
+    if (seqBrushPat === 0) {
+      pushUndo("Erase Clip");
+      if (hitClip) trk.cells[hitClip.startK] = 0;
+      else trk.cells[k] = 0;
+      activeDrag = { type: "seqErase" };
+      seqCacheDirty = true; requestDraw(); return;
+    }
+    pushUndo("Paint Clips");
+    const val = trk.mode === "loop" ? 1 : (seqBrushPat || 1);
+    const clipSpan = getClipSpanTicks(trk);
+    trk.cells[k] = val;
+    activeDrag = {
+      type: "seqPaintChain",
+      trackIdx: t,
+      val,
+      clipSpan,
+      nextFreeK: k + clipSpan
+    };
+    statusMsg = `PAINTED CLIP AT BAR ${(k / TICKS_PER_BAR + 1).toFixed(2)} (DRAG RIGHT TO CHAIN AFTER FULL LENGTH)`;
+    seqCacheDirty = true; requestDraw(); return;
+  }
+}
+
+function handleStepGridInteract(px, py, isDrag, isRight) {
+  if (!stepGridRect) return;
+  const gx = stepGridRect.x, gy = stepGridRect.y + ST_TOP_H, gw = stepGridRect.w, gh = stepGridRect.h - ST_TOP_H;
+  if (px < gx || py < gy || px > gx + gw || py > gy + gh) return;
+  const p = Math.floor(((py - gy) / gh) * 8); if (p < 0 || p >= 8) return;
+
+  if (px < gx + ST_HDR_W) {
+    if (!isDrag && !isRight) {
+      const now = performance.now();
+      const key = `stepHdr_${p}`;
+      if (now - lastClick.t < 340 && lastClick.key === key) {
+        lastClick.t = 0;
+        activePad = p;
+        switchTab("edit");
+        statusMsg = `OPENED PAD ${p + 1} IN WAVE EDITOR`;
+        return;
+      }
+      lastClick = { t: now, key };
+      triggerPad(p, false, 0, true);
+    }
+    return;
+  }
+
+  const s = Math.floor(((px - (gx + ST_HDR_W)) / (gw - ST_HDR_W)) * 16); if (s < 0 || s >= 16) return;
+  const pat = stepPats[activeStepPat], pitches = stepPitches[activeStepPat];
+
+  if (isRight) {
+    pushUndo("Reset Step Pitch");
+    pitches[p][s] = 0;
+    statusMsg = `P${p + 1} STEP ${s + 1} PITCH RESET TO 0`;
+    requestDraw(); return;
+  }
+  if (stepEditMode === "pitch") {
+    if (!isDrag) {
+      pushUndo("Adjust Step Pitch");
+      pat[p][s] = 1;
+      activeDrag = { type: "stepPitch", p, s, startY: py, startSemi: pitches[p][s] };
+      if (pads[p].rawBuf) triggerPad(p, false, 0, true, Math.pow(2, pitches[p][s] / 12));
+      seqCacheDirty = true; requestDraw();
+    }
+    return;
+  }
+  if (!isDrag) {
+    pushUndo("Edit Steps");
+    activeDrag = { type: "stepPaint", val: pat[p][s] ? 0 : 1 };
+  }
+  if (activeDrag && activeDrag.type === "stepPaint" && pat[p][s] !== activeDrag.val) {
+    pat[p][s] = activeDrag.val; seqCacheDirty = true; requestDraw();
+  }
+}
+
+cv.oncontextmenu = e => e.preventDefault();
+
+cv.onmousedown = e => {
+  mx = e.clientX; my = e.clientY;
+
+  if (openMenu) {
+    if (menuPanelRect && hit(menuPanelRect, mx, my)) {
+      for (const it of menuItemRects) {
+        if (!it.disabled && hit(it, mx, my)) {
+          openMenu = null;
+          it.action();
+          requestDraw();
+          return;
+        }
+      }
+      return;
+    }
+    const clickedMenuBtn = (menuBtnRects.file && hit(menuBtnRects.file, mx, my)) || (menuBtnRects.edit && hit(menuBtnRects.edit, mx, my));
+    if (!clickedMenuBtn) { openMenu = null; requestDraw(); }
+  }
+
+  if (e.button === 2) {
+    if (activeTab === "seq" && seqGridRect && hit(seqGridRect, mx, my)) handleSeqCellInteract(mx, my, false, true, e.shiftKey, e.altKey);
+    else if (activeTab === "step" && stepGridRect && hit(stepGridRect, mx, my)) handleStepGridInteract(mx, my, false, true);
+    return;
+  }
+  down = true;
+
+  for (let i = uiBtns.length - 1; i >= 0; i--) {
+    if (hit(uiBtns[i], mx, my)) { pressedBtnId = uiBtns[i].id; uiBtns[i].onClick(); requestDraw(); return; }
+  }
+  for (let i = uiSliders.length - 1; i >= 0; i--) {
+    if (hit(uiSliders[i], mx, my)) {
+      pushUndo(`Adjust ${uiSliders[i].label}`);
+      activeSlider = uiSliders[i];
+      updateSliderFromX(activeSlider, mx);
+      return;
+    }
+  }
+  if (treeThumbRect && hit(treeThumbRect, mx, my)) { activeDrag = { type: "tscr", startY: my, startScroll: treeScroll }; return; }
+  if (treeListRect && hit(treeListRect, mx, my)) {
+    const item = treeFlat[Math.floor((my - treeListRect.y + treeScroll) / 21)];
+    if (item) {
+      if (item.type === "dir") {
+        item.open = !item.open;
+        if (item.open && !item.loaded) { item.loaded = true; readDirNodes(item.handle).then(ch => { item.children = ch; rebuildTreeFlat(); }); }
+        else rebuildTreeFlat();
+      } else activeDrag = { type: "treePress", item, sx: mx, sy: my };
+    }
+    return;
+  }
+  if (activeTab === "edit") {
+    const pad = pads[activePad];
+    if (ovRect && hit(ovRect, mx, my)) { activeDrag = { type: "ov" }; panOverviewAt(mx); return; }
+    if (hScrRect && hit(hScrRect, mx, my)) {
+      if (hThumbRect && hit(hThumbRect, mx, my)) activeDrag = { type: "hscr", startX: mx, startOff: viewOffset };
+      else if (viewZoom > 1.001) { viewOffset = ((mx - hScrRect.x) / hScrRect.w) - (1 / viewZoom) * 0.5; clampView(); waveCacheDirty = true; requestDraw(); }
+      return;
+    }
+    if (waveRect && hit(waveRect, mx, my) && pad && pad.rawBuf) {
+      const viewSpan = 1 / viewZoom;
+      const stX = waveRect.x + ((pad.st - viewOffset) / viewSpan) * waveRect.w;
+      const enX = waveRect.x + ((pad.en - viewOffset) / viewSpan) * waveRect.w;
+      if (!pad.lockSE) {
+        if (Math.abs(mx - stX) <= 16) { pushUndo("Trim Start"); activeDrag = { type: "st" }; return; }
+        if (Math.abs(mx - enX) <= 16) { pushUndo("Trim End"); activeDrag = { type: "en" }; return; }
+      }
+      startEditorPlay(Math.max(0, Math.min(1, viewOffset + ((mx - waveRect.x) / waveRect.w) * viewSpan)));
+      return;
+    }
+  }
+  if (activeTab === "seq") {
+    if (seqHScrRect && hit(seqHScrRect, mx, my)) {
+      if (seqHThumbRect && hit(seqHThumbRect, mx, my)) activeDrag = { type: "seqHscr", startX: mx, startOff: seqScroll };
+      else if (seqZoom > 1.001) { seqScroll = ((mx - seqHScrRect.x) / seqHScrRect.w) - (1 / seqZoom) * 0.5; clampSeqView(); seqCacheDirty = true; requestDraw(); }
+      return;
+    }
+    if (seqLoopRect && hit(seqLoopRect, mx, my)) {
+      pushUndo("Adjust Loop Region");
+      const visBars = seqBars / seqZoom, startBarF = seqScroll * seqBars;
+      const barToX = b => seqLoopRect.x + ((b - startBarF) / visBars) * seqLoopRect.w;
+      const lx0 = barToX(seqLoopStart), lx1 = barToX(seqLoopEnd);
+      const snapBars = SEQ_SNAPS[seqSnapIdx].ticks / TICKS_PER_BAR;
+      seqLoopOn = true;
+      if (Math.abs(mx - lx0) <= 10) activeDrag = { type: "seqLoopL" };
+      else if (Math.abs(mx - lx1) <= 10) activeDrag = { type: "seqLoopR" };
+      else if (mx > lx0 && mx < lx1) activeDrag = { type: "seqLoopMove", startBarF: seqXToBarF(mx), origStart: seqLoopStart, origLen: seqLoopEnd - seqLoopStart };
+      else {
+        const b = Math.max(0, Math.min(seqBars - snapBars, Math.floor(seqXToBarF(mx) / snapBars) * snapBars));
+        seqLoopStart = b; seqLoopEnd = Math.min(seqBars, b + snapBars);
+        activeDrag = { type: "seqLoopR" };
+      }
+      seqCacheDirty = true; requestDraw(); return;
+    }
+    if (seqScrubRect && hit(seqScrubRect, mx, my)) {
+      activeDrag = { type: "seqScrub" };
+      scrubSeqToBarF(seqXToBarF(mx));
+      return;
+    }
+    if (seqGridRect && hit(seqGridRect, mx, my)) {
+      handleSeqCellInteract(mx, my, false, false, e.shiftKey, e.altKey);
+      return;
+    }
+  }
+  if (activeTab === "step" && stepGridRect && hit(stepGridRect, mx, my)) { handleStepGridInteract(mx, my, false, false); return; }
+};
+
+window.addEventListener("mousemove", e => {
+  mx = e.clientX; my = e.clientY;
+  if (openMenu) {
+    if (openMenu === "file" && menuBtnRects.edit && hit(menuBtnRects.edit, mx, my)) { openMenu = "edit"; requestDraw(); return; }
+    if (openMenu === "edit" && menuBtnRects.file && hit(menuBtnRects.file, mx, my)) { openMenu = "file"; requestDraw(); return; }
+  }
+  if (activeSlider) { updateSliderFromX(activeSlider, mx); return; }
+  if (activeDrag) {
+    const pad = pads[activePad];
+    const snapTicks = SEQ_SNAPS[seqSnapIdx].ticks;
+    const snapBars = snapTicks / TICKS_PER_BAR;
+    if (activeDrag.type === "treePress") {
+      if (Math.hypot(mx - activeDrag.sx, my - activeDrag.sy) > 6) activeDrag = { type: "treeDrag", name: activeDrag.item.name, fileFn: activeDrag.item.fileFn };
+    } else if (activeDrag.type === "ov") panOverviewAt(mx);
+    else if (activeDrag.type === "hscr" && hScrRect && hThumbRect && viewZoom > 1.001) {
+      viewOffset = activeDrag.startOff + ((mx - activeDrag.startX) / Math.max(1, hScrRect.w - hThumbRect.w)) * (1 - 1 / viewZoom);
+      clampView(); waveCacheDirty = true;
+    } else if (activeDrag.type === "seqHscr" && seqHScrRect && seqHThumbRect && seqZoom > 1.001) {
+      seqScroll = activeDrag.startOff + ((mx - activeDrag.startX) / Math.max(1, seqHScrRect.w - seqHThumbRect.w)) * (1 - 1 / seqZoom);
+      clampSeqView(); seqCacheDirty = true;
+    } else if (activeDrag.type === "seqLoopL") {
+      const v = Math.round(seqXToBarF(mx) / snapBars) * snapBars;
+      seqLoopStart = Math.max(0, Math.min(seqLoopEnd - snapBars, v));
+      seqCacheDirty = true; statusMsg = `LOOP REGION: BARS ${(seqLoopStart + 1).toFixed(2)} - ${seqLoopEnd.toFixed(2)}`;
+    } else if (activeDrag.type === "seqLoopR") {
+      const v = Math.round(seqXToBarF(mx) / snapBars) * snapBars;
+      seqLoopEnd = Math.max(seqLoopStart + snapBars, Math.min(seqBars, v));
+      seqCacheDirty = true; statusMsg = `LOOP REGION: BARS ${(seqLoopStart + 1).toFixed(2)} - ${seqLoopEnd.toFixed(2)}`;
+    } else if (activeDrag.type === "seqLoopMove") {
+      const delta = Math.round((seqXToBarF(mx) - activeDrag.startBarF) / snapBars) * snapBars;
+      const ns = Math.max(0, Math.min(seqBars - activeDrag.origLen, activeDrag.origStart + delta));
+      seqLoopStart = ns; seqLoopEnd = ns + activeDrag.origLen;
+      seqCacheDirty = true; statusMsg = `LOOP REGION: BARS ${(seqLoopStart + 1).toFixed(2)} - ${seqLoopEnd.toFixed(2)}`;
+    } else if (activeDrag.type === "seqScrub") {
+      scrubSeqToBarF(seqXToBarF(mx));
+    } else if (activeDrag.type === "seqMoveSingle") {
+      const cur = getSeqTrackAndTick(mx, my);
+      if (cur) {
+        const trk = seqTracks[activeDrag.trackIdx];
+        const maxK = seqBars * TICKS_PER_BAR - snapTicks;
+        const rawTarget = cur.rawTick - activeDrag.grabOffsetTicks;
+        const newK = Math.max(0, Math.min(maxK, Math.round(rawTarget / snapTicks) * snapTicks));
+        if (newK !== activeDrag.curK) {
+          trk.cells.set(activeDrag.backup);
+          if (!activeDrag.clone) trk.cells[activeDrag.origK] = 0;
+          trk.cells[newK] = activeDrag.val;
+          activeDrag.curK = newK;
+          seqPasteAnchor = { t: activeDrag.trackIdx, k: newK };
+          seqCacheDirty = true;
+          statusMsg = `MOVED CLIP TO BAR ${(newK / TICKS_PER_BAR + 1).toFixed(2)}`;
+        }
+      }
+    } else if (activeDrag.type === "seqPaintChain") {
+      const cur = getSeqTrackAndTick(mx, my);
+      if (cur) {
+        const trk = seqTracks[activeDrag.trackIdx];
+        const maxK = seqBars * TICKS_PER_BAR;
+        while (cur.rawTick >= activeDrag.nextFreeK && activeDrag.nextFreeK < maxK) {
+          const placeK = activeDrag.nextFreeK;
+          const existing = findClipAtTick(trk, placeK);
+          if (!existing) {
+            trk.cells[placeK] = activeDrag.val;
+            activeDrag.nextFreeK = placeK + activeDrag.clipSpan;
+          } else {
+            activeDrag.nextFreeK = existing.endK;
+          }
+          seqCacheDirty = true;
+        }
+      }
+    } else if (activeDrag.type === "seqErase") {
+      const cur = getSeqTrackAndTick(mx, my);
+      if (cur) {
+        const trk = seqTracks[cur.t];
+        const hitClip = findClipAtTick(trk, cur.rawTick);
+        if (hitClip) { trk.cells[hitClip.startK] = 0; seqCacheDirty = true; }
+        else if (trk.cells[cur.k]) { trk.cells[cur.k] = 0; seqCacheDirty = true; }
+      }
+    } else if (activeDrag.type === "seqMarquee") {
+      const cur = getSeqTrackAndTick(mx, my);
+      if (cur) {
+        seqSel = {
+          t0: Math.min(activeDrag.anchorT, cur.t),
+          t1: Math.max(activeDrag.anchorT, cur.t),
+          k0: Math.min(activeDrag.anchorK, cur.k),
+          k1: Math.max(activeDrag.anchorK, cur.k) + snapTicks
+        };
+        seqCacheDirty = true;
+      }
+    } else if (activeDrag.type === "seqGroupMove") {
+      const cur = getSeqTrackAndTick(mx, my);
+      if (cur) {
+        const dt = cur.t - activeDrag.startT;
+        const dk = Math.round((cur.k - activeDrag.startK) / snapTicks) * snapTicks;
+        const o = activeDrag.origSel;
+        const spanT = o.t1 - o.t0, spanK = o.k1 - o.k0;
+        const maxK = seqBars * TICKS_PER_BAR;
+        const nt0 = Math.max(0, Math.min(seqTracks.length - 1 - spanT, o.t0 + dt));
+        const nk0 = Math.max(0, Math.min(maxK - spanK, o.k0 + dk));
+
+        seqTracks.forEach((tr, idx) => tr.cells.set(activeDrag.backup[idx]));
+        if (!activeDrag.clone) {
+          for (let t = o.t0; t <= o.t1; t++) for (let k = o.k0; k < o.k1; k++) seqTracks[t].cells[k] = 0;
+        }
+        for (let t = nt0; t <= nt0 + spanT; t++) for (let k = nk0; k < nk0 + spanK; k++) seqTracks[t].cells[k] = 0;
+        for (const it of activeDrag.items) {
+          seqTracks[nt0 + it.dt].cells[nk0 + it.dk] = it.val;
+        }
+        seqSel = { t0: nt0, t1: nt0 + spanT, k0: nk0, k1: nk0 + spanK };
+        seqPasteAnchor = { t: nt0, k: nk0 };
+        seqCacheDirty = true;
+      }
+    } else if (activeDrag.type === "tscr" && treeThumbRect) {
+      treeScroll = activeDrag.startScroll + ((my - activeDrag.startY) / Math.max(1, treeThumbRect.trackH - treeThumbRect.h)) * treeThumbRect.maxScroll;
+    } else if ((activeDrag.type === "st" || activeDrag.type === "en") && waveRect && pad && !pad.lockSE) {
+      const norm = Math.max(0, Math.min(1, viewOffset + ((mx - waveRect.x) / waveRect.w) * (1 / viewZoom)));
+      if (activeDrag.type === "st") pad.st = Math.min(pad.en - 0.004, norm);
+      else pad.en = Math.max(pad.st + 0.004, norm);
+      pad.dirty = true; ovCacheDirty = waveCacheDirty = true;
+    } else if (activeDrag.type === "stepPaint") handleStepGridInteract(mx, my, true, false);
+    else if (activeDrag.type === "stepPitch") {
+      const nextSemi = Math.max(-12, Math.min(12, activeDrag.startSemi + Math.round((activeDrag.startY - my) / 10)));
+      if (stepPitches[activeStepPat][activeDrag.p][activeDrag.s] !== nextSemi) {
+        stepPitches[activeStepPat][activeDrag.p][activeDrag.s] = nextSemi;
+        statusMsg = `P${activeDrag.p + 1} STEP ${activeDrag.s + 1}: ${nextSemi > 0 ? "+" + nextSemi : nextSemi} ST`;
+        if (pads[activeDrag.p].rawBuf) triggerPad(activeDrag.p, false, 0, true, Math.pow(2, nextSemi / 12));
+      }
+    }
+    requestDraw(); return;
+  }
+  requestDraw();
+});
+
+window.addEventListener("mouseup", async () => {
+  down = false; pressedBtnId = null; activeSlider = null;
+  if (activeDrag) {
+    const d = activeDrag; activeDrag = null;
+    if (d.type === "treePress") auditionTreeFile(await d.item.fileFn(), d.item.name);
+    else if (d.type === "treeDrag") {
+      for (const z of dropZones) if (hit(z, mx, my)) { const f = await d.fileFn(); if (f) z.onDrop(f, mx, my); break; }
+    }
+  }
+  requestDraw();
+});
+
+cv.addEventListener("wheel", e => {
+  e.preventDefault();
+  if (treeListRect && hit(treeListRect, e.clientX, e.clientY)) { treeScroll += e.deltaY * 0.6; requestDraw(); return; }
+  if (activeTab === "edit" && waveRect && hit(waveRect, e.clientX, e.clientY) && pads[activePad].rawBuf) {
+    const rel = Math.max(0, Math.min(1, (e.clientX - waveRect.x) / waveRect.w));
+    setZoom(viewZoom * (e.deltaY < 0 ? 1.5 : 1 / 1.5), viewOffset + rel * (1 / viewZoom));
+    return;
+  }
+  if (activeTab === "seq" && seqGridRect && hit(seqGridRect, e.clientX, e.clientY)) {
+    const gx = seqGridRect.x + SEQ_GRID_X, gw = seqGridRect.w - SEQ_GRID_X;
+    const rel = Math.max(0, Math.min(1, (e.clientX - gx) / gw));
+    setSeqZoom(seqZoom * (e.deltaY < 0 ? 1.35 : 1 / 1.35), seqScroll + rel * (1 / seqZoom));
+  }
+}, { passive: false });
+
+cv.ondragover = e => e.preventDefault();
+cv.ondrop = e => {
+  e.preventDefault();
+  const f = e.dataTransfer.files && e.dataTransfer.files[0]; if (!f) return;
+  if (/\.json$/i.test(f.name)) { loadProjectFile(f); return; }
+  for (const z of dropZones) if (hit(z, e.clientX, e.clientY)) { z.onDrop(f, e.clientX, e.clientY); return; }
+};
+
+window.addEventListener("keydown", e => {
+  const mod = e.ctrlKey || e.metaKey;
+  const key = e.key.toLowerCase();
+
+  if (mod && key === "z") { e.preventDefault(); if (e.shiftKey) doRedo(); else doUndo(); return; }
+  if (mod && key === "y") { e.preventDefault(); doRedo(); return; }
+  if (mod && key === "s") { e.preventDefault(); saveProject(); return; }
+  if (mod && key === "o") { e.preventDefault(); projIn.click(); return; }
+
+  if (e.key === "Escape" && openMenu) { openMenu = null; requestDraw(); return; }
+
+  if (activeTab === "seq") {
+    if (mod && key === "x") { e.preventDefault(); cutSeqSelection(); return; }
+    if (mod && key === "c") { e.preventDefault(); copySeqSelection(); return; }
+    if (mod && key === "v") { e.preventDefault(); pasteSeqClipboard(); return; }
+    if (mod && key === "d") { e.preventDefault(); duplicateSeqSelection(); return; }
+    if (mod && key === "a") { e.preventDefault(); selectAllTimeline(); return; }
+    if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); deleteSeqSelection(); return; }
+    if (e.key === "Escape") { seqSel = null; seqPasteAnchor = null; seqCacheDirty = true; requestDraw(); return; }
+    if (!mod && key === "s") { seqTool = seqTool === "select" ? "paint" : "select"; statusMsg = `TOOL: ${seqTool.toUpperCase()}`; requestDraw(); return; }
+  }
+  if (!mod && e.key >= "1" && e.key <= "8" && activeTab === "pads") { triggerPad(+e.key - 1); requestDraw(); }
+  if (e.code === "Space") {
+    e.preventDefault();
+    if (activeTab === "pads") { if (seqRunning) stopSeq(); else if (stepRunning) stopStepPat(); else startSeq(); }
+    else if (activeTab === "edit") { if (seqRunning) stopSeq(); else edPlaying ? stopEditorPlay() : startEditorPlay(); }
+    else if (activeTab === "seq") seqRunning ? stopSeq() : startSeq();
+    else if (activeTab === "step") stepRunning ? stopStepPat() : startStepPat();
+  }
+});
+
+function onResize() {
+  cv.width = window.innerWidth; cv.height = window.innerHeight;
+  buildBgCache(cv.width, cv.height);
+  ovCacheDirty = waveCacheDirty = seqCacheDirty = true;
+  requestDraw();
+}
+window.addEventListener("resize", onResize);
+onResize();
+})();
+</script>
+</body>
+</html>
